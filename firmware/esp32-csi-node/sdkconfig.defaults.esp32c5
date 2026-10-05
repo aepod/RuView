@@ -64,7 +64,8 @@ CONFIG_C6_TWT_ENABLE=n
 # the raw 15.4 RX path never delivered a frame on our C6 (ruvnet/RuView#762),
 # ESP-NOW is the working time-sync transport, and on a single shared 2.4 GHz
 # transceiver the 15.4 stack only costs coexistence time against CSI capture.
-# Re-evaluate on C5 silicon before enabling; keep the ESP-NOW path for now.
+# Re-tested on C5 (2026-10-05, ADR-383): with the RX fixes, 15.4 RX blocks Wi-Fi
+# association and delivers corrupted frames. Keep it off; ESP-NOW is the transport.
 CONFIG_IEEE802154_ENABLED=y
 CONFIG_OPENTHREAD_ENABLED=n
 CONFIG_C6_TIMESYNC_CHANNEL=26

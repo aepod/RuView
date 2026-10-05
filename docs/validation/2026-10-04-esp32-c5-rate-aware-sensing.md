@@ -163,4 +163,15 @@ With 802.15.4 enabled, node 6 also aborted once on its first boot after each fla
 
 ESP-NOW time-sync between the same two nodes worked throughout: 1652-1678 of 1701 beacons matched. The C5 default stays `C6_TIMESYNC_ENABLE=n`.
 
+**Root cause and retest.** The zero-RX result came from two bugs in `c6_timesync.c`:
+1. RX was armed once at init. After each beacon TX the driver returns to idle, not RX, so each node listened only until its first beacon. Fixed with `esp_ieee802154_set_rx_when_idle(true)`.
+2. The RX callback runs in ISR context and called `ESP_LOGI`. That takes a lock and aborts, which was the boot abort. Logging moved to the timer task.
+
+After both fixes, two 3-minute runs on both nodes:
+- **Results:** each node received 245-345 frames, and there were no aborts.
+- **Wi-Fi blocked:** authentication timed out repeatedly (`auth -> init`, reason 2), and the STA only joined after about 179 s. Setting the 15.4 coex priorities to their lowest (idle = `IEEE802154_IDLE`, TX/RX = `LOW`) didn't change this.
+- **Corrupted frames:** a dumped frame had the beacon's PHY length (27) and frame control (`41 88`), but its body was the first 4 bytes repeated: `1b 41 88 00 1b 41 88 00 ...`. Only 1 frame per node passed the magic check.
+
+The 15.4 time-sync path stays off on the C5.
+
 Not done: occupancy qualification (needs an empty-room session).

@@ -25,6 +25,7 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_ieee802154.h"
+#include "esp_idf_version.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -47,9 +48,16 @@ typedef struct __attribute__((packed)) {
 
 static uint64_t s_local_eui    = 0;
 static uint64_t s_leader_eui   = 0;       /* 0 = unknown */
-static int64_t  s_offset_us    = 0;       /* leader_us - local_us */
-static uint64_t s_last_seen_us = 0;
-static bool     s_is_leader    = false;
+static volatile int64_t  s_offset_us    = 0;       /* leader_us - local_us */
+static volatile uint64_t s_last_seen_us = 0;
+static volatile bool     s_is_leader    = false;
+/* Set in the RX ISR, logged from the beacon timer task (no logging in ISR). */
+static volatile bool     s_step_down_pending = false;
+/* First frame that fails the beacon check, copied in the ISR and dumped once
+ * from the timer task, to tell foreign 15.4 traffic from a layout mismatch. */
+static uint8_t           s_odd_frame[24];
+static volatile uint8_t  s_odd_len = 0;
+static volatile bool     s_odd_pending = false, s_odd_logged = false;
 static uint8_t  s_channel      = 15;
 static TimerHandle_t s_beacon_timer = NULL;
 
@@ -74,10 +82,11 @@ static uint64_t eui64_bytes_to_u64(const uint8_t eui[8])
            ((uint64_t)eui[6] << 8 ) |  (uint64_t)eui[7];
 }
 
-static uint32_t s_tx_count = 0;
-static uint32_t s_tx_fail  = 0;
-static uint32_t s_rx_count = 0;
-static uint32_t s_rx_magic_match = 0;
+static volatile uint32_t s_tx_count = 0;
+static volatile uint32_t s_tx_fail  = 0;
+static volatile uint32_t s_tx_done_fail = 0;
+static volatile uint32_t s_rx_count = 0;
+static volatile uint32_t s_rx_magic_match = 0;
 
 static void send_beacon(void)
 {
@@ -109,32 +118,48 @@ static void send_beacon(void)
     if (r != ESP_OK) s_tx_fail++;
     /* Diag log every 10 beacons. */
     if ((s_tx_count % 10) == 1) {
-        ESP_LOGI(TAG, "tx#%lu (fail=%lu) rx#%lu (magic_match=%lu) is_leader=%d",
+        ESP_LOGI(TAG, "tx#%lu (fail=%lu, air_fail=%lu) rx#%lu (magic_match=%lu) is_leader=%d",
                  (unsigned long)s_tx_count, (unsigned long)s_tx_fail,
+                 (unsigned long)s_tx_done_fail,
                  (unsigned long)s_rx_count, (unsigned long)s_rx_magic_match,
                  (int)s_is_leader);
     }
 }
 
-/* KNOWN ISSUE (see WITNESS-LOG-110 §D1 / task #30):
- * Empirically observed on 3 C6 boards with channel=26, OpenThread disabled,
- * promiscuous=true, and IDF v5.4 reference RX/TX callback pattern: only 1
- * RX event ever fires after init, despite ~381 successful TX events from
- * the other boards in the same 38-second window. Manual re-arm with
- * esp_ieee802154_receive() in either callback context bootloops the
- * driver. Hypothesis: half-duplex radio + driver state-machine issue;
- * needs an IDF maintainer trace or a working multi-board reference.
- * Cross-node sync claim (ADR-110 §B3) is BLOCKED on this. */
+/* RX path (ADR-383, 2026-10-05). The callbacks below run in ISR context
+ * (esp_ieee802154.h). Two bugs made RX look broken on C6 (#762) and C5:
+ *  1. RX was armed once at init. After each beacon TX the driver returns to
+ *     idle, not RX, unless rx_when_idle is set, so a node listened only
+ *     until its first beacon went out. Fixed with esp_ieee802154_set_rx_when_idle().
+ *  2. receive_done called ESP_LOGI(); logging takes a lock, and taking a lock
+ *     in ISR context aborts (lock_acquire_generic). Logging now happens in the
+ *     beacon timer task from flags set here.
+ * esp_ieee802154_receive_handle_done() only releases the RX buffer; with
+ * rx_when_idle the driver itself stays in RX. Don't call receive() here.
+ *
+ * Still NOT usable alongside Wi-Fi CSI (MEASURED on 2x ESP32-C5, IDF 5.5.2,
+ * 2026-10-05), which is why C6_TIMESYNC_ENABLE stays off:
+ *  - With 15.4 parked in RX, Wi-Fi authentication times out repeatedly
+ *    (auth -> init, reason 2) and the STA only joined after ~3 min, even with
+ *    the 15.4 coex priorities set to their lowest (below).
+ *  - Received frames have the right PHY length and frame control but the
+ *    body is the first 4 bytes repeated (e.g. 1b 41 88 00 1b 41 88 00 ...),
+ *    so beacons fail the magic check. Looks like a driver/RX-buffer issue.
+ * ESP-NOW (c6_sync_espnow.c) is the working time-sync transport. */
 void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *frame_info)
 {
     s_rx_count++;
     /* PHY length is frame[0]; payload starts at frame[1]. */
-    if (frame == NULL || frame[0] < (9 + sizeof(ts_beacon_t) + 2)) {
-        if (frame) esp_ieee802154_receive_handle_done(frame);
-        return;
-    }
+    if (frame == NULL) return;
     const ts_beacon_t *b = (const ts_beacon_t *)&frame[1 + 9];
-    if (b->magic != TS_MAGIC || b->proto_ver != TS_PROTO_VER) {
+    if (frame[0] < (9 + sizeof(ts_beacon_t) + 2) ||
+        b->magic != TS_MAGIC || b->proto_ver != TS_PROTO_VER) {
+        if (!s_odd_logged && !s_odd_pending) {
+            uint8_t n = frame[0] + 1 < sizeof(s_odd_frame) ? frame[0] + 1 : sizeof(s_odd_frame);
+            memcpy(s_odd_frame, frame, n);
+            s_odd_len = n;
+            s_odd_pending = true;
+        }
         esp_ieee802154_receive_handle_done(frame);
         return;
     }
@@ -149,13 +174,11 @@ void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *fr
                 /* Step down — somebody else is broadcasting; lowest EUI wins
                  * (deferred — for now last-heard wins). */
                 s_is_leader = false;
-                ESP_LOGI(TAG, "stepping down — heard another leader beacon");
+                s_step_down_pending = true;   /* logged from the timer task */
             }
         }
     }
-    /* handle_done auto-restarts RX in the IDF driver; calling
-     * esp_ieee802154_receive() here would double-arm and panic
-     * (verified empirically — 25 reboot loops observed). */
+    /* Release the RX buffer; rx_when_idle keeps the radio in RX. */
     esp_ieee802154_receive_handle_done(frame);
 }
 
@@ -163,22 +186,32 @@ void esp_ieee802154_transmit_done(const uint8_t *frame,
                                   const uint8_t *ack,
                                   esp_ieee802154_frame_info_t *ack_frame_info)
 {
-    (void)frame; (void)ack; (void)ack_frame_info;
-    /* Note: do NOT call esp_ieee802154_receive() here — it panics the
-     * driver (verified empirically, all 3 boards bootloop). The IDF
-     * driver internally manages RX/TX state transitions. */
+    (void)frame; (void)ack_frame_info;
+    /* Beacons are broadcast without an ACK request, but if an ACK frame is
+     * ever handed over, its buffer must be released (esp_ieee802154.h). */
+    if (ack) esp_ieee802154_receive_handle_done(ack);
 }
 
 void esp_ieee802154_transmit_failed(const uint8_t *frame, esp_ieee802154_tx_error_t error)
 {
-    (void)frame;
-    ESP_LOGD(TAG, "tx failed: %d", error);
+    (void)frame; (void)error;
+    s_tx_done_fail++;   /* ISR context: count only, no logging */
 }
 
 static void beacon_timer_cb(TimerHandle_t t)
 {
     (void)t;
     uint64_t now = (uint64_t)esp_timer_get_time();
+    if (s_step_down_pending) {
+        s_step_down_pending = false;
+        ESP_LOGI(TAG, "stepping down — heard another leader beacon");
+    }
+    if (s_odd_pending) {
+        s_odd_pending = false;
+        s_odd_logged = true;
+        ESP_LOGI(TAG, "first non-beacon frame (%u bytes incl. PHY len):", (unsigned)s_odd_len);
+        ESP_LOG_BUFFER_HEX(TAG, s_odd_frame, s_odd_len);
+    }
     if (s_is_leader) {
         send_beacon();
     } else if ((now - s_last_seen_us) > (TS_VALID_WINDOW_MS * 1000ULL)) {
@@ -227,6 +260,20 @@ esp_err_t c6_timesync_init(uint8_t channel)
     esp_ieee802154_set_short_address(0x0000);
     esp_ieee802154_set_extended_address(mac);
     esp_ieee802154_set_channel(s_channel);
+#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE && ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+    /* (set_coex_config is declared in esp_ieee802154.h from IDF 5.5.)
+     * The C5/C6 share one RF front end between Wi-Fi and 15.4. Parked in RX,
+     * 15.4 starved Wi-Fi (join took ~3 min). Give 15.4 idle-RX the lowest
+     * priority and TX/RX low, so Wi-Fi (and CSI capture) wins arbitration. */
+    esp_ieee802154_coex_config_t coex = {
+        .idle    = IEEE802154_IDLE,
+        .txrx    = IEEE802154_LOW,
+        .txrx_at = IEEE802154_MIDDLE,
+    };
+    esp_ieee802154_set_coex_config(coex);
+#endif
+    /* Stay in RX whenever not transmitting (see the RX path note above). */
+    esp_ieee802154_set_rx_when_idle(true);
     esp_ieee802154_receive();
 
     /* Start as candidate leader; first received beacon will demote us if needed. */
