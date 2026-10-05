@@ -3382,6 +3382,72 @@ mod calibration_expiry_tests {
         assert!(calibrated_vitals_for_publication(&state, &candidates, 1, 1_500).is_none());
     }
 
+    fn one_occupant_window(state: &mut AppStateInner) {
+        let baseline = state.field_model.as_ref().unwrap().modes().unwrap().baseline[0].clone();
+        state.node_states.get_mut(&5).unwrap().field_model_history =
+            (0..50).map(|_| baseline.iter().map(|value| value + 0.3).collect()).collect();
+        assert_eq!(state.person_count_at(1_500), 1);
+    }
+
+    fn qualified_edge_packet() -> Esp32VitalsPacket {
+        Esp32VitalsPacket {
+            node_id: 5,
+            presence: true,
+            fall_detected: false,
+            motion: false,
+            breathing_rate_bpm: 15.0,
+            heartrate_bpm: 72.0,
+            rssi: -42,
+            n_persons: 1,
+            person_count_valid: true,
+            motion_energy: 0.1,
+            presence_score: 0.9,
+            timestamp_ms: 42,
+        }
+    }
+
+    /// Before this gate the endpoint returned the raw 15/72 BPM once
+    /// calibration was fresh and the count was one, without the holdout
+    /// window the other vitals paths require.
+    #[test]
+    fn edge_vitals_endpoint_withholds_rates_without_a_holdout_window() {
+        let mut state = state_with_receipt();
+        one_occupant_window(&mut state);
+        assert!(state.explicit_calibration_fresh_at(1_500));
+        state.edge_vitals = Some(qualified_edge_packet());
+        let body = edge_vitals_response(&state, 1_500);
+        assert_eq!(body["status"], "ok");
+        assert!(body["edge_vitals"]["breathing_rate_bpm"].is_null(), "{body}");
+        assert!(body["edge_vitals"]["heartrate_bpm"].is_null(), "{body}");
+        assert_eq!(body["edge_vitals"]["presence"], true);
+        assert_eq!(body["numeric_vitals_authorized"], false);
+        assert_eq!(body["abstention_reason"], "vital_quality_gate_failed");
+    }
+
+    #[test]
+    fn edge_vitals_endpoint_withholds_weak_rates() {
+        let mut state = state_with_runtime_window();
+        one_occupant_window(&mut state);
+        let mut weak = qualified_edge_packet();
+        weak.presence_score = 0.2;
+        state.edge_vitals = Some(weak);
+        let body = edge_vitals_response(&state, 1_500);
+        assert!(body["edge_vitals"]["heartrate_bpm"].is_null(), "{body}");
+        assert_eq!(body["numeric_vitals_authorized"], false);
+    }
+
+    #[test]
+    fn edge_vitals_endpoint_publishes_rates_the_calibrated_gate_authorises() {
+        let mut state = state_with_runtime_window();
+        one_occupant_window(&mut state);
+        state.edge_vitals = Some(qualified_edge_packet());
+        let body = edge_vitals_response(&state, 1_500);
+        assert_eq!(body["edge_vitals"]["breathing_rate_bpm"], 15.0);
+        assert_eq!(body["edge_vitals"]["heartrate_bpm"], 72.0);
+        assert_eq!(body["numeric_vitals_authorized"], true);
+        assert!(body["abstention_reason"].is_null());
+    }
+
     #[test]
     fn bootstrap_field_model_remains_negative_only_for_person_count() {
         let runtime = state_with_model(false);
@@ -8678,6 +8744,18 @@ fn calibrated_vitals_for_publication(
     vitals_for_publication(candidates, true, evidence.person_count)
 }
 
+/// Numeric candidates carried by a legacy edge vitals packet. Publication
+/// still requires `calibrated_vitals_for_publication`.
+fn edge_vital_candidates(raw: &Esp32VitalsPacket) -> VitalSigns {
+    VitalSigns {
+        breathing_rate_bpm: (raw.breathing_rate_bpm > 0.0).then_some(raw.breathing_rate_bpm),
+        heart_rate_bpm: (raw.heartrate_bpm > 0.0).then_some(raw.heartrate_bpm),
+        breathing_confidence: if raw.presence { 0.7 } else { 0.0 },
+        heartbeat_confidence: if raw.presence { 0.7 } else { 0.0 },
+        signal_quality: raw.presence_score as f64,
+    }
+}
+
 /// Why an edge vitals message carries no numeric rates. `None` only when the
 /// calibrated gate authorised publication.
 fn vitals_abstention_reason(
@@ -10890,26 +10968,53 @@ async fn edge_registry_endpoint(
 async fn edge_vitals_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
     let observed_at_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let explicit_single_occupant = s.explicit_calibration_fresh_at(observed_at_unix_ms)
-        && s.person_count_at(observed_at_unix_ms) == 1;
+    Json(edge_vitals_response(&s, observed_at_unix_ms))
+}
+
+/// The latest raw edge packet, with its numeric rates governed by the same
+/// calibrated gate as `/api/v1/vital-signs` (holdout window, quality and
+/// confidence), not only by calibration freshness and a count of one.
+fn edge_vitals_response(s: &AppStateInner, observed_at_unix_ms: u64) -> serde_json::Value {
+    let person_count = s.person_count_at(observed_at_unix_ms);
+    let explicit_single_occupant =
+        s.explicit_calibration_fresh_at(observed_at_unix_ms) && person_count == 1;
     if !explicit_single_occupant {
-        return Json(serde_json::json!({
+        return serde_json::json!({
             "status": "abstained",
             "edge_vitals": null,
             "message": "Fresh explicit calibration with exactly one occupant is required.",
-        }));
+        });
     }
-    match &s.edge_vitals {
-        Some(v) => Json(serde_json::json!({
-            "status": "ok",
-            "edge_vitals": v,
-        })),
-        None => Json(serde_json::json!({
+    let Some(raw) = &s.edge_vitals else {
+        return serde_json::json!({
             "status": "no_data",
             "edge_vitals": null,
             "message": "No edge vitals packet received yet. Ensure ESP32 edge_tier >= 1.",
-        })),
+        });
+    };
+    let published = calibrated_vitals_for_publication(
+        s,
+        &edge_vital_candidates(raw),
+        person_count,
+        observed_at_unix_ms,
+    );
+    let mut packet = serde_json::to_value(raw).unwrap_or(serde_json::Value::Null);
+    if let Some(fields) = packet.as_object_mut() {
+        fields.insert(
+            "breathing_rate_bpm".into(),
+            serde_json::json!(published.as_ref().and_then(|v| v.breathing_rate_bpm)),
+        );
+        fields.insert(
+            "heartrate_bpm".into(),
+            serde_json::json!(published.as_ref().and_then(|v| v.heart_rate_bpm)),
+        );
     }
+    serde_json::json!({
+        "status": "ok",
+        "edge_vitals": packet,
+        "numeric_vitals_authorized": published.is_some(),
+        "abstention_reason": vitals_abstention_reason(published.is_some(), false, true, person_count),
+    })
 }
 
 /// GET /api/v1/wasm-events — latest WASM events from ESP32 (ADR-040).
@@ -13077,15 +13182,7 @@ async fn udp_receiver_task(
                         (vitals.presence_score as f64).min(1.0),
                         &[],
                     );
-                    let vital_candidates = VitalSigns {
-                        breathing_rate_bpm: (vitals.breathing_rate_bpm > 0.0)
-                            .then_some(vitals.breathing_rate_bpm),
-                        heart_rate_bpm: (vitals.heartrate_bpm > 0.0)
-                            .then_some(vitals.heartrate_bpm),
-                        breathing_confidence: if vitals.presence { 0.7 } else { 0.0 },
-                        heartbeat_confidence: if vitals.presence { 0.7 } else { 0.0 },
-                        signal_quality: vitals.presence_score as f64,
-                    };
+                    let vital_candidates = edge_vital_candidates(&vitals);
                     let explicit_calibration_fresh =
                         s.explicit_calibration_fresh_at(observed_at_unix_ms);
                     let published_vitals = calibrated_vitals_for_publication(
