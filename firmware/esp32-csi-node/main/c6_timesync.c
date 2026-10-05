@@ -26,6 +26,9 @@
 #include "esp_timer.h"
 #include "esp_ieee802154.h"
 #include "esp_idf_version.h"
+#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
+#include "esp_coexist.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -87,6 +90,13 @@ static volatile uint32_t s_tx_fail  = 0;
 static volatile uint32_t s_tx_done_fail = 0;
 static volatile uint32_t s_rx_count = 0;
 static volatile uint32_t s_rx_magic_match = 0;
+static volatile uint32_t s_tx_skipped_busy = 0;
+/* esp_ieee802154_transmit() is asynchronous: the radio reads the buffer after
+ * the call returns. A stack buffer here was reused before the radio read it,
+ * so peers received garbage (RAM/register addresses) after a valid header.
+ * Keep the frame in a static buffer, untouched until transmit_done/failed. */
+static uint8_t           s_tx_buf[64];
+static volatile bool     s_tx_in_flight = false;
 
 static void send_beacon(void)
 {
@@ -110,46 +120,52 @@ static void send_beacon(void)
     b->leader_epoch_us = (uint64_t)esp_timer_get_time();
     size_t total = 9 + sizeof(ts_beacon_t);
     /* ESP-IDF esp_ieee802154 transmit: first byte is the PHY length. */
-    uint8_t tx_buf[64];
-    tx_buf[0] = (uint8_t)(total + 2);  /* +2 for FCS appended by HW */
-    memcpy(&tx_buf[1], frame, total);
-    esp_err_t r = esp_ieee802154_transmit(tx_buf, false);
+    if (s_tx_in_flight) {           /* previous beacon still owned by the radio */
+        s_tx_skipped_busy++;
+        return;
+    }
+    s_tx_buf[0] = (uint8_t)(total + 2);  /* +2 for FCS appended by HW */
+    memcpy(&s_tx_buf[1], frame, total);
+    s_tx_in_flight = true;
+    esp_err_t r = esp_ieee802154_transmit(s_tx_buf, false);
     s_tx_count++;
-    if (r != ESP_OK) s_tx_fail++;
+    if (r != ESP_OK) {
+        s_tx_fail++;
+        s_tx_in_flight = false;
+    }
     /* Diag log every 10 beacons. */
     if ((s_tx_count % 10) == 1) {
-        ESP_LOGI(TAG, "tx#%lu (fail=%lu, air_fail=%lu) rx#%lu (magic_match=%lu) is_leader=%d",
+        ESP_LOGI(TAG, "tx#%lu (fail=%lu, air_fail=%lu, busy_skip=%lu) rx#%lu (magic_match=%lu) is_leader=%d",
                  (unsigned long)s_tx_count, (unsigned long)s_tx_fail,
-                 (unsigned long)s_tx_done_fail,
+                 (unsigned long)s_tx_done_fail, (unsigned long)s_tx_skipped_busy,
                  (unsigned long)s_rx_count, (unsigned long)s_rx_magic_match,
                  (int)s_is_leader);
     }
 }
 
-/* RX path (ADR-383, 2026-10-05). The callbacks below run in ISR context
- * (esp_ieee802154.h). Two bugs made RX look broken on C6 (#762) and C5:
- *  1. RX was armed once at init. After each beacon TX the driver returns to
- *     idle, not RX, unless rx_when_idle is set, so a node listened only
- *     until its first beacon went out. Fixed with esp_ieee802154_set_rx_when_idle().
- *  2. receive_done called ESP_LOGI(); logging takes a lock, and taking a lock
- *     in ISR context aborts (lock_acquire_generic). Logging now happens in the
- *     beacon timer task from flags set here.
- * esp_ieee802154_receive_handle_done() only releases the RX buffer; with
- * rx_when_idle the driver itself stays in RX. Don't call receive() here.
- *
- * Still NOT usable alongside Wi-Fi CSI (MEASURED on 2x ESP32-C5, IDF 5.5.2,
- * 2026-10-05), which is why C6_TIMESYNC_ENABLE stays off:
- *  - With 15.4 parked in RX, Wi-Fi authentication times out repeatedly
- *    (auth -> init, reason 2) and the STA only joined after ~3 min, even with
- *    the 15.4 coex priorities set to their lowest (below).
- *  - In this firmware, received frames had the right PHY length and frame
- *    control but a body of the first 4 bytes repeated, so beacons failed the
- *    magic check. A minimal app does NOT corrupt frames (with or without
- *    PSRAM), so this is something in RuView's setup; cause still open.
- *  - In that minimal app, with Wi-Fi off, RX stops after the first frame even
- *    with rx_when_idle; with a Wi-Fi STA up, RX works (~99 %) but the STA
- *    never connects (reason 2, then 201 NO_AP_FOUND).
- * ESP-NOW (c6_sync_espnow.c) is the working time-sync transport. */
+/* 802.15.4 time-sync (ADR-383, 2026-10-05). The esp_ieee802154 callbacks
+ * below run in ISR context. Four bugs made this path look dead on C6 (#762)
+ * and C5; all fixed here, verified on two ESP32-C5 boards (IDF 5.5.2):
+ *  1. RX was armed once at init. The driver should return to RX after each
+ *     TX when rx_when_idle is set, but on C5 it doesn't unless Wi-Fi coex
+ *     activity re-triggers it (minimal reproducer: 0-1 of ~1750 frames).
+ *     So rx_when_idle is set AND RX is re-armed from task context after
+ *     every TX (transmit_done/failed defer rearm_rx() to the timer task;
+ *     calling receive() in the ISR itself is what used to bootloop).
+ *  2. receive_done called ESP_LOGI(); taking the log lock in ISR context
+ *     aborts (lock_acquire_generic). Logging moved to the timer task.
+ *  3. The beacon was built in a stack buffer, but esp_ieee802154_transmit()
+ *     is asynchronous, so the radio sent whatever reused that stack: peers
+ *     got a valid header followed by RAM/register addresses. Static buffer.
+ *  4. Wi-Fi + 15.4 coexistence was never enabled. With 15.4 in RX the STA
+ *     could not authenticate or even find the AP (reason 2, then 201).
+ *     esp_coex_wifi_i154_enable() now runs in c6_timesync_init(), before
+ *     Wi-Fi starts.
+ * Result: STA joins in ~6 s; the follower received 708/708 beacons intact.
+ * Cost: CSI callback yield drops from ~40 to ~27 pps while 15.4 shares the
+ * radio, so C6_TIMESYNC_ENABLE stays off by default; ESP-NOW is the default
+ * time-sync transport. esp_ieee802154_receive_handle_done() only releases
+ * the RX buffer. */
 void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *frame_info)
 {
     s_rx_count++;
@@ -186,6 +202,20 @@ void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *fr
     esp_ieee802154_receive_handle_done(frame);
 }
 
+/* Runs in the timer daemon task (deferred from transmit_done/failed). */
+static void rearm_rx(void *arg1, uint32_t arg2)
+{
+    (void)arg1; (void)arg2;
+    esp_ieee802154_receive();
+}
+
+static void IRAM_ATTR defer_rearm_rx_from_isr(void)
+{
+    BaseType_t woken = pdFALSE;
+    xTimerPendFunctionCallFromISR(rearm_rx, NULL, 0, &woken);
+    portYIELD_FROM_ISR(woken);
+}
+
 void esp_ieee802154_transmit_done(const uint8_t *frame,
                                   const uint8_t *ack,
                                   esp_ieee802154_frame_info_t *ack_frame_info)
@@ -194,12 +224,16 @@ void esp_ieee802154_transmit_done(const uint8_t *frame,
     /* Beacons are broadcast without an ACK request, but if an ACK frame is
      * ever handed over, its buffer must be released (esp_ieee802154.h). */
     if (ack) esp_ieee802154_receive_handle_done(ack);
+    s_tx_in_flight = false;
+    defer_rearm_rx_from_isr();
 }
 
 void esp_ieee802154_transmit_failed(const uint8_t *frame, esp_ieee802154_tx_error_t error)
 {
     (void)frame; (void)error;
     s_tx_done_fail++;   /* ISR context: count only, no logging */
+    s_tx_in_flight = false;
+    defer_rearm_rx_from_isr();
 }
 
 static void beacon_timer_cb(TimerHandle_t t)
@@ -251,6 +285,14 @@ esp_err_t c6_timesync_init(uint8_t channel)
     esp_read_mac(mac, ESP_MAC_BASE);
     s_channel   = (channel >= 11 && channel <= 26) ? channel : 15;
 
+#if CONFIG_ESP_COEX_SW_COEXIST_ENABLE
+    /* Wi-Fi + 15.4 coexistence must be switched on explicitly (as Espressif's
+     * ot_br and zigbee_gateway examples do). Without it, 15.4 RX starved the
+     * Wi-Fi STA (reason 2, then 201 NO_AP_FOUND). Must run before Wi-Fi
+     * starts; c6_timesync_init() runs before wifi_init_sta(). */
+    esp_err_t coex_ret = esp_coex_wifi_i154_enable();
+    ESP_LOGI(TAG, "esp_coex_wifi_i154_enable: %s", esp_err_to_name(coex_ret));
+#endif
     esp_err_t ret = esp_ieee802154_enable();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "ieee802154_enable failed: %s", esp_err_to_name(ret));

@@ -172,18 +172,28 @@ After both fixes, two 3-minute runs on both nodes:
 - **Wi-Fi blocked:** authentication timed out repeatedly (`auth -> init`, reason 2), and the STA only joined after about 179 s. Setting the 15.4 coex priorities to their lowest (idle = `IEEE802154_IDLE`, TX/RX = `LOW`) didn't change this.
 - **Corrupted frames:** a dumped frame had the beacon's PHY length (27) and frame control (`41 88`), but its body was the first 4 bytes repeated: `1b 41 88 00 1b 41 88 00 ...`. Only 1 frame per node passed the magic check.
 
-**Minimal reproducer.** A two-board IDF-only app using the same radio calls, no RuView code. 3-minute runs:
+**Minimal reproducer.** A two-board IDF-only app using the same radio calls. 90 s to 3 min runs, ~850-1750 frames sent per board:
 
-| Wi-Fi | RX on node A / B (peer sent ~1750) | Frames intact | Wi-Fi |
-|---|---|---|---|
-| off | 0 / 1 | yes | n/a |
-| STA on | 1729 / 1725 | all | never connected (reason 2, then 201) |
+| Run | RX intact on A / B | Wi-Fi |
+|---|---|---|
+| Wi-Fi off, both boards TX | 0 / 1 | n/a |
+| Wi-Fi off, A RX-only, B TX-only | 844 / - | n/a |
+| Wi-Fi off, RX re-armed from a task after each TX | 846 / 851 of 851 | n/a |
+| Wi-Fi STA on, no coex enable | 1729 / 1725 | never connected (reason 2, then 201) |
+| Wi-Fi STA on, `esp_coex_wifi_i154_enable()` | 721 / 715 of 849 | Got IP in 3.6 s, 0 disconnects |
 
-The same app with PSRAM enabled received 643 / 641 of 650 frames, all intact. So:
-- with Wi-Fi off, RX stops after the first frame even with `rx_when_idle`;
-- with Wi-Fi on, 802.15.4 RX starves the STA scan;
-- the frame corruption seen in this firmware is RuView-specific and its cause is still open.
+**What this shows:**
+- RX itself works.
+- On the C5, the driver doesn't return to RX after the node's own TX, even with `rx_when_idle`; a task-context `esp_ieee802154_receive()` fixes it.
+- Wi-Fi starvation was a missing coex enable.
+- The minimal app never corrupted a frame. In RuView, that came from the beacon being built in a stack buffer that the async transmit read after it had been reused: the dumped "payload" contained RAM and register addresses (`0x4082F000`, `0x600C5090`).
 
-The 15.4 time-sync path stays off on the C5.
+**RuView with all four fixes.** `c6_timesync.c` now has RX re-armed in task context, no logging in the ISR, a static TX buffer, and coex enabled. Both nodes, 3 min, Wi-Fi auto (5 GHz ch 40):
+- **Wi-Fi:** Got IP in 5.9 s.
+- **15.4:** the follower received 708 beacons, all 708 matching. Leader hand-over worked at 109 s. No aborts.
+- **ESP-NOW sync:** 1371-1375 of 1701 matched.
+- **Cost:** the CSI callback `yield` mean over the last 60 s was 26.5 pps, against about 40 pps with 15.4 off, because 15.4 shares the radio. About 33 % of 15.4 TX attempts were refused by the coex arbiter.
+
+802.15.4 time-sync works now but stays opt-in (`C6_TIMESYNC_ENABLE=n` by default) because of the CSI cost. ESP-NOW remains the default.
 
 Not done: occupancy qualification (needs an empty-room session).

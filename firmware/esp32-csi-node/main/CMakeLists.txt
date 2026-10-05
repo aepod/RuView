@@ -53,7 +53,7 @@ set(REQUIRES
 # available in main CMakeLists.txt evaluation — we use the IDF_TARGET variable
 # that idf.py sets from sdkconfig.defaults / set-target.
 if(IDF_TARGET STREQUAL "esp32c6" OR IDF_TARGET STREQUAL "esp32c5")
-    list(APPEND REQUIRES ieee802154 ulp esp_hw_support)
+    list(APPEND REQUIRES ieee802154 ulp esp_hw_support esp_coex)
 endif()
 
 # ESP-IDF 6 split the temperature sensor driver out of the legacy `driver`
