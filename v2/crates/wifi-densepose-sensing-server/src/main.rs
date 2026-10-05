@@ -1173,15 +1173,20 @@ struct NodeState {
     /// Most recent novelty score in [0.0, 1.0] (0 = exact-match in bank,
     /// 1 = no overlap). Consumed by the model-wake gate downstream.
     pub(crate) last_novelty_score: Option<f32>,
-    /// ADR-110 / issue #1005: the `(n_subcarriers, ppdu_type)` grid this
-    /// node's rolling windows were built on. ESP32-C6 nodes interleave
-    /// HE-SU 256-bin frames with HT 64-bin frames on one socket; mixing
-    /// the two symbol grids in `frame_history` corrupts variance/baseline
-    /// statistics. See [`NodeState::accept_grid`].
-    active_grid: Option<(u16, wifi_densepose_hardware::PpduType)>,
-    /// Grids of this node's last `GRID_VOTE_FRAMES` frames, accepted or not.
-    /// `accept_grid` locks onto the most frequent one.
-    grid_votes: VecDeque<(u16, wifi_densepose_hardware::PpduType)>,
+    /// ADR-110 / issue #1005: this node's primary `(n_subcarriers,
+    /// ppdu_type)` grid, the one it sends most often. ESP32-C6 nodes
+    /// interleave HE-SU 256-bin frames with HT 64-bin frames on one socket
+    /// and ESP32-S3 nodes several HT grids. Vitals, novelty, the published
+    /// raw amplitudes and calibration follow this grid. See
+    /// [`NodeState::accept_grid`].
+    active_grid: Option<CsiGrid>,
+    /// Grids of this node's last `GRID_VOTE_FRAMES` frames.
+    grid_votes: VecDeque<CsiGrid>,
+    /// Grid of the window currently in `frame_history` and `baseline_*`:
+    /// the grid of the newest admitted frame.
+    loaded_grid: Option<CsiGrid>,
+    /// Windows of this node's other recent grids, least recently used first.
+    parked_grids: Vec<ParkedGridWindow>,
     /// Header-only recent raw grid observations used to choose one stable,
     /// comparable calibration stream. No CSI amplitudes are retained here.
     raw_grid_observations: VecDeque<RawGridObservation>,
@@ -1214,6 +1219,19 @@ const NOVELTY_HISTORY_CAPACITY: usize = 64;
 /// ADR-084 Pass 3 — feature-vector schema version. Bump on changes to
 /// subcarrier ordering / normalisation so banks reject stale data.
 const NOVELTY_SKETCH_VERSION: u16 = 1;
+
+/// `(n_subcarriers, ppdu_type)` of an ESP32 CSI frame.
+type CsiGrid = (u16, wifi_densepose_hardware::PpduType);
+
+/// Rolling window and motion baseline of a grid that is not the one loaded
+/// into `NodeState::frame_history` (see `NodeState::accept_grid`).
+struct ParkedGridWindow {
+    grid: CsiGrid,
+    frame_history: VecDeque<Vec<f64>>,
+    baseline_motion: f64,
+    baseline_frames: u64,
+}
+
 /// Recent header-only evidence window used to choose a stable field-model
 /// stream. The rate floor is 20% above the 1,000 / 600 s completion minimum.
 const CALIBRATION_GRID_EVIDENCE_WINDOW: std::time::Duration =
@@ -1559,6 +1577,8 @@ impl NodeState {
             last_novelty_score: None,
             active_grid: None,
             grid_votes: VecDeque::with_capacity(GRID_VOTE_FRAMES),
+            loaded_grid: None,
+            parked_grids: Vec::new(),
             raw_grid_observations: VecDeque::with_capacity(
                 CALIBRATION_GRID_EVIDENCE_CAPACITY,
             ),
@@ -1644,6 +1664,10 @@ impl NodeState {
         &self,
         now: std::time::Instant,
     ) -> Option<(CsiGridKey, CalibrationGridEvidence)> {
+        let primary = self.active_grid.map(|(n_subcarriers, ppdu_type)| CsiGridKey {
+            n_subcarriers,
+            ppdu_type: ppdu_type.to_byte(),
+        });
         self.calibration_grid_candidates(now)
             .into_iter()
             .filter(|(grid, evidence)| {
@@ -1653,25 +1677,24 @@ impl NodeState {
                     && evidence.max_gap_s < CALIBRATION_GRID_MAX_GAP_S
                     && evidence.latest_age_s < CALIBRATION_GRID_MAX_GAP_S
             })
-            // Density first. This was chosen to agree with `accept_grid` when
-            // that gate locked each node onto the densest grid it had seen;
-            // since #1894 the gate locks onto the most frequent grid instead,
-            // and this ordering has not been revisited. On an ESP32-C6 both
-            // pick HE-SU 256-bin over the ~16% HT 64-bin minority. Ordering selection by
-            // gap first picked exactly that minority: it is sparse, so its
-            // arrivals look smooth, while the grid the node actually keeps
-            // using scores worse on gap.
+            // The node's primary grid (`accept_grid`) first, so calibration
+            // binds the grid the node sends most and agrees with the live
+            // path (PLAN 5.23). Density first used to stand in for it: on an
+            // S3 node sending 192 bins on two frames in three and 306 on the
+            // third, it bound the 306 minority.
             //
-            // Measured: a capture bound 64sc on node 11, every node then
-            // locked onto 256sc, the bound grid went stale with no frame for
-            // five minutes, frame_count froze at 10,997 and the capture could
-            // never finalize -- `collecting` forever with no error surfaced.
-            // A wider grid that the node will keep emitting beats a narrower
-            // one that admission is designed to discard.
+            // Without a primary grid, or when it does not qualify, density
+            // then gap. Ordering by gap first picked an ESP32-C6's ~16% HT
+            // 64-bin minority: it is sparse, so its arrivals look smooth,
+            // while the grid the node actually keeps using scores worse on
+            // gap. Measured: a capture bound 64sc on node 11, the bound grid
+            // went stale with no frame for five minutes, frame_count froze at
+            // 10,997 and the capture never finalized -- `collecting` forever
+            // with no error surfaced.
             .min_by(|(left_grid, left), (right_grid, right)| {
-                right_grid
-                    .n_subcarriers
-                    .cmp(&left_grid.n_subcarriers)
+                (Some(*right_grid) == primary)
+                    .cmp(&(Some(*left_grid) == primary))
+                    .then_with(|| right_grid.n_subcarriers.cmp(&left_grid.n_subcarriers))
                     .then_with(|| left.max_gap_s.total_cmp(&right.max_gap_s))
                     .then_with(|| right.rate_hz.total_cmp(&left.rate_hz))
                     .then_with(|| left_grid.ppdu_type.cmp(&right_grid.ppdu_type))
@@ -1698,44 +1721,105 @@ impl NodeState {
         self.field_model_latest_seen = Some(now);
     }
 
-    /// ADR-110 / issue #1005 grid gate: decide whether a frame on `grid`
-    /// may enter this node's feature path, and update `active_grid`.
+    /// ADR-110 / issue #1005 grid gate: load the rolling window of `grid`
+    /// into `frame_history` / `baseline_*` and update the primary grid.
     ///
-    /// Returns `true` to accept. Policy: lock onto the grid this node sends
-    /// most often over its last `GRID_VOTE_FRAMES` frames, and accept only
-    /// frames on that grid. Switching needs the challenger to outnumber the
-    /// active grid by 3:2, so interleaved grids don't flap the lock. On a
-    /// switch the rolling amplitude history and motion baseline are cleared
-    /// so two symbol grids are never mixed in one window. On an ESP32-C6
-    /// the HE-SU 256-bin grid is ~84% of frames, so the ~16% HT minority is
-    /// rejected as before; the caller still records the arrival for
-    /// fps/liveness.
+    /// Symbol grids are not bin-comparable (HT-LTF vs HE-LTF, 192 vs 306
+    /// bins), so each grid a node sends keeps its own window and motion
+    /// baseline. A frame on another grid parks the loaded window and
+    /// restores its own; neither is cleared. At most `MAX_GRID_WINDOWS`
+    /// windows are kept per node, dropping the least recently used.
     ///
-    /// Issue #1894: this used to lock onto the densest grid ever seen. Real
-    /// ESP32-S3 nodes interleave several grids (one measured node: 192 bins
-    /// on 88% of frames, 306 on 6%), so that locked onto the 306 minority
-    /// and rejected nearly every frame; a node whose radio moved to a
-    /// sparser grid for good was rejected forever.
-    fn accept_grid(&mut self, grid: (u16, wifi_densepose_hardware::PpduType)) -> bool {
+    /// `active_grid` is the primary grid: the one sent most often over the
+    /// last `GRID_VOTE_FRAMES` frames, switching only when a challenger
+    /// outnumbers it 3:2. Inputs that keep one series across frames
+    /// (vitals, novelty, the published amplitudes) take the primary grid
+    /// only, and the vital-sign detector is reset when it switches.
+    ///
+    /// Returns `false` only for a frame with no subcarriers.
+    ///
+    /// History: #1005 locked onto the densest grid seen; #1894 locked onto
+    /// the most frequent grid and rejected the rest, clearing the window on
+    /// every switch. A measured S3 node sending 192 and 306 bins about
+    /// 50/50 lost ~47% of its frames that way and switched 12 times in 3
+    /// minutes.
+    fn accept_grid(&mut self, grid: CsiGrid) -> bool {
+        if grid.0 == 0 {
+            return false;
+        }
         if self.grid_votes.len() == GRID_VOTE_FRAMES {
             self.grid_votes.pop_front();
         }
         self.grid_votes.push_back(grid);
-        let Some(active) = self.active_grid else {
-            self.active_grid = Some(grid);
-            return true;
+        match self.active_grid {
+            None => self.active_grid = Some(grid),
+            Some(active) if active != grid => {
+                let votes = |g| self.grid_votes.iter().filter(|&&v| v == g).count();
+                if 2 * votes(grid) > 3 * votes(active) {
+                    self.active_grid = Some(grid);
+                    self.vital_detector.reset();
+                }
+            }
+            Some(_) => {}
+        }
+        self.load_grid_window(grid);
+        true
+    }
+
+    fn load_grid_window(&mut self, grid: CsiGrid) {
+        // The first grid adopts whatever the window already holds.
+        let Some(loaded) = self.loaded_grid.replace(grid) else {
+            return;
         };
-        if grid != active {
-            let votes = |g| self.grid_votes.iter().filter(|&&v| v == g).count();
-            if 2 * votes(grid) > 3 * votes(active) {
-                self.active_grid = Some(grid);
-                self.frame_history.clear();
-                self.baseline_motion = 0.0;
-                self.baseline_frames = 0;
-                return true;
+        if loaded == grid {
+            return;
+        }
+        self.parked_grids.push(ParkedGridWindow {
+            grid: loaded,
+            frame_history: std::mem::take(&mut self.frame_history),
+            baseline_motion: self.baseline_motion,
+            baseline_frames: self.baseline_frames,
+        });
+        let restored = self
+            .parked_grids
+            .iter()
+            .position(|window| window.grid == grid)
+            .map(|index| self.parked_grids.remove(index));
+        (self.frame_history, self.baseline_motion, self.baseline_frames) = match restored {
+            Some(window) => (window.frame_history, window.baseline_motion, window.baseline_frames),
+            None => (VecDeque::new(), 0.0, 0),
+        };
+        while self.parked_grids.len() >= MAX_GRID_WINDOWS {
+            self.parked_grids.remove(0);
+        }
+    }
+
+    /// Rolling window of the primary grid, for outputs that must not
+    /// alternate between grids from one frame to the next.
+    fn primary_frame_history(&self) -> &VecDeque<Vec<f64>> {
+        if self.active_grid != self.loaded_grid {
+            if let Some(window) = self
+                .parked_grids
+                .iter()
+                .find(|window| Some(window.grid) == self.active_grid)
+            {
+                return &window.frame_history;
             }
         }
-        grid == active
+        &self.frame_history
+    }
+
+    /// Arrival rate of frames on `grid`: this node's CSI rate scaled by that
+    /// grid's share of the last `GRID_VOTE_FRAMES` frames. A grid's window
+    /// holds only its own frames, so spectral features need its rate, not
+    /// the node's.
+    fn grid_sample_rate_hz(&self, grid: CsiGrid) -> f64 {
+        let rate = self.effective_sample_rate_hz();
+        let votes = self.grid_votes.iter().filter(|&&g| g == grid).count();
+        if votes == 0 {
+            return rate;
+        }
+        rate * votes as f64 / self.grid_votes.len() as f64
     }
 
     /// ADR-084 cluster-Pi novelty step. Truncates / zero-pads the
@@ -2495,8 +2579,14 @@ mod privacy_mode_surface_tests {
 const ESP32_OFFLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How many recent frames per node the grid gate votes over (see
-/// `NodeState::accept_grid`): about a second of CSI at typical rates.
-const GRID_VOTE_FRAMES: usize = 64;
+/// `NodeState::accept_grid`): about 15-25 s of CSI at typical rates. Long,
+/// because the primary grid gates no frames any more and a switch resets
+/// the vital-sign detector; at 64 frames a node sending two grids about
+/// 50/50 switched 12 times in 3 minutes (MEASURED, ESP32-S3).
+const GRID_VOTE_FRAMES: usize = 512;
+
+/// Most per-grid rolling windows kept per node (`NodeState::accept_grid`).
+const MAX_GRID_WINDOWS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CalibrationSequenceOrder {
@@ -11273,8 +11363,8 @@ mod grid_gate_tests {
     ];
 
     /// Issue #1894: locking onto the densest grid seen kept only the 306-bin
-    /// minority of this node and rejected ~90% of its frames. The gate must
-    /// keep the grid the node mostly sends, without flapping.
+    /// minority of this node and rejected ~90% of its frames. Every frame is
+    /// admitted, and the primary grid is the one the node mostly sends.
     #[test]
     fn real_s3_interleaved_grids_keep_the_majority_grid() {
         let mut ns = NodeState::new();
@@ -11292,13 +11382,13 @@ mod grid_gate_tests {
             }
         }
         assert_eq!(ns.active_grid, Some(ht(192)));
-        assert_eq!(switches, 0, "interleaved grids must not flap the lock");
-        assert_eq!(accepted, on_192, "every 192-bin frame and nothing else");
-        assert!(accepted * 10 > 320 * 8, "accepted {accepted} of 320");
+        assert_eq!(switches, 0, "interleaved grids must not flap the primary");
+        assert_eq!(accepted, 320);
+        assert!(on_192 * 10 > 320 * 8, "{on_192} of 320 on 192 bins");
     }
 
     /// The other real node sends 306 on about two frames in three and 192 on
-    /// the rest. A 2:1 interleave must hold the 306 lock.
+    /// the rest. A 2:1 interleave keeps 306 primary and admits every frame.
     #[test]
     fn two_to_one_interleave_does_not_flap() {
         let mut ns = NodeState::new();
@@ -11308,34 +11398,87 @@ mod grid_gate_tests {
             accepted += usize::from(ns.accept_grid(ht(n)));
         }
         assert_eq!(ns.active_grid, Some(ht(306)));
-        assert_eq!(accepted, 200);
+        assert_eq!(accepted, 300);
     }
 
-    /// A node whose radio moves to a sparser grid for good is re-locked once
-    /// the new grid dominates the vote window, with the old window cleared.
+    /// A node whose radio moves to a sparser grid for good: its frames are
+    /// admitted at once into a fresh window, and the primary grid follows
+    /// once the new grid dominates the vote window. The old window is parked,
+    /// not cleared.
     #[test]
-    fn permanent_drift_to_a_sparser_grid_relocks() {
+    fn permanent_drift_to_a_sparser_grid_moves_the_primary() {
         let mut ns = NodeState::new();
         for _ in 0..GRID_VOTE_FRAMES {
-            assert!(ns.accept_grid(ht(128)));
+            assert!(feed(&mut ns, ht(128)));
         }
-        ns.frame_history.push_back(vec![1.0; 128]);
-        let mut first_accept = None;
+        let mut switched_at = None;
         for i in 0..GRID_VOTE_FRAMES {
-            if ns.accept_grid(ht(64)) && first_accept.is_none() {
-                first_accept = Some(i);
-                assert!(ns.frame_history.is_empty(), "relock must clear the window");
+            assert!(feed(&mut ns, ht(64)));
+            assert_eq!(ns.frame_history.len(), (i + 1).min(FRAME_HISTORY_CAPACITY));
+            if switched_at.is_none() && ns.active_grid == Some(ht(64)) {
+                switched_at = Some(i);
             }
         }
-        let first = first_accept.expect("64-bin stream never re-locked");
-        assert!(first < GRID_VOTE_FRAMES, "re-locked after {first} frames");
-        assert_eq!(ns.active_grid, Some(ht(64)));
+        assert!(switched_at.is_some(), "primary never followed the 64-bin stream");
+        assert_eq!(ns.parked_grids.len(), 1);
+        assert_eq!(ns.parked_grids[0].frame_history.len(), FRAME_HISTORY_CAPACITY);
+    }
+
+    /// At most `MAX_GRID_WINDOWS` windows per node; the least recently used
+    /// grid's window is dropped and comes back empty.
+    #[test]
+    fn grid_windows_are_bounded_with_oldest_eviction() {
+        let mut ns = NodeState::new();
+        let grids = [64, 128, 188, 192, 306].map(ht);
+        for &grid in &grids {
+            for _ in 0..3 {
+                assert!(feed(&mut ns, grid));
+            }
+        }
+        assert_eq!(ns.parked_grids.len(), MAX_GRID_WINDOWS - 1);
+        assert!(ns.parked_grids.iter().all(|w| w.grid != ht(64)));
+        assert!(feed(&mut ns, ht(128)), "parked window restored");
+        assert_eq!(ns.frame_history.len(), 4);
+        assert!(feed(&mut ns, ht(64)), "evicted grid starts over");
+        assert_eq!(ns.frame_history.len(), 1);
+        assert!(!ns.accept_grid((0, PpduType::HtLegacy)), "empty grid");
+    }
+
+    /// Each grid's features use that grid's own arrival rate.
+    #[test]
+    fn grid_sample_rate_is_the_grids_share_of_the_node_rate() {
+        let mut ns = NodeState::new();
+        for &grid in &synth_runs(ht(306), ht(192), 66, GRID_VOTE_FRAMES) {
+            ns.accept_grid(grid);
+        }
+        let node = ns.effective_sample_rate_hz();
+        let share = |g| ns.grid_sample_rate_hz(g) / node;
+        assert!((share(ht(306)) + share(ht(192)) - 1.0).abs() < 1e-9);
+        assert!((0.55..0.77).contains(&share(ht(306))), "{}", share(ht(306)));
+        assert_eq!(ns.grid_sample_rate_hz(ht(64)), node, "unseen grid");
+    }
+
+    /// The primary grid switches rarely on a 50/50 node, and published
+    /// amplitudes come from the primary window only.
+    #[test]
+    fn half_and_half_primary_is_stable_and_drives_published_amplitudes() {
+        let mut ns = NodeState::new();
+        let mut switches = 0;
+        for &grid in &synth_runs(ht(192), ht(306), 50, 6_000) {
+            let before = ns.active_grid;
+            feed(&mut ns, grid);
+            switches += usize::from(before.is_some() && ns.active_grid != before);
+            let primary = ns.active_grid.expect("primary set").0;
+            let published = ns.primary_frame_history().back().expect("primary window");
+            assert_eq!(published.len(), usize::from(primary));
+        }
+        assert!(switches <= 2, "{switches} primary switches in 6,000 frames");
     }
 
     /// ESP32-C6 (#1005): HE-SU 256 on ~84% of frames, HT 64 on the rest.
-    /// The HT minority stays out of the feature path.
+    /// HE stays primary; the HT minority is admitted into its own window.
     #[test]
-    fn c6_he_majority_rejects_ht_minority() {
+    fn c6_he_majority_stays_primary() {
         let mut ns = NodeState::new();
         assert!(ns.accept_grid(ht(64))); // HT frame first after boot
         for i in 0..200 {
@@ -11347,7 +11490,129 @@ mod grid_gate_tests {
             }
         }
         assert_eq!(ns.active_grid, Some((256, PpduType::HeSu)));
-        assert!(!ns.accept_grid(ht(64)));
+        assert!(ns.accept_grid(ht(64)));
+        assert_eq!(ns.active_grid, Some((256, PpduType::HeSu)));
+    }
+
+    /// What the UDP receiver does with a frame: admitted frames go into the
+    /// window `accept_grid` left loaded. Panics if that window holds a frame
+    /// of another shape.
+    fn feed(ns: &mut NodeState, grid: (u16, PpduType)) -> bool {
+        if !ns.accept_grid(grid) {
+            return false;
+        }
+        let n = usize::from(grid.0);
+        assert!(
+            ns.frame_history.iter().all(|f| f.len() == n),
+            "{n}-bin frame loaded into a window holding another grid"
+        );
+        ns.frame_history.push_back(vec![f64::from(grid.0); n]);
+        if ns.frame_history.len() > FRAME_HISTORY_CAPACITY {
+            ns.frame_history.pop_front();
+        }
+        true
+    }
+
+    /// Deterministic interleave: runs of 1-4 frames, each run on `a` with
+    /// probability `a_pct`%, else on `b`. Same shape as the measured S3 nodes
+    /// (about 2.2 frames per run), synthesized rather than copied.
+    fn synth_runs(
+        a: (u16, PpduType),
+        b: (u16, PpduType),
+        a_pct: u64,
+        frames: usize,
+    ) -> Vec<(u16, PpduType)> {
+        let mut lcg: u64 = 0x2157;
+        let mut next = move || {
+            lcg = lcg.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            lcg >> 33
+        };
+        let mut seq = Vec::with_capacity(frames + 4);
+        while seq.len() < frames {
+            let grid = if next() % 100 < a_pct { a } else { b };
+            let run = 1 + (next() % 4) as usize;
+            seq.extend(std::iter::repeat_n(grid, run));
+        }
+        seq.truncate(frames);
+        seq
+    }
+
+    /// #2157 follow-up: an S3 node sending 192 and 306 bins about 50/50 had
+    /// ~47% of its frames rejected and its window cleared on every flip of
+    /// the vote (12 flips in 3 minutes, MEASURED). Every frame must now reach
+    /// a window of its own grid, and no window may be cleared by the other
+    /// grid's frames.
+    #[test]
+    fn half_and_half_192_306_keeps_every_frame_in_its_own_window() {
+        let seq = synth_runs(ht(192), ht(306), 50, 3_000);
+        let on_192 = seq.iter().filter(|g| g.0 == 192).count();
+        assert!((1_350..=1_650).contains(&on_192), "not ~50/50: {on_192}");
+
+        let mut ns = NodeState::new();
+        let mut seen: Vec<((u16, PpduType), usize)> = Vec::new();
+        for &grid in &seq {
+            assert!(feed(&mut ns, grid), "{grid:?} frame rejected");
+            let count = match seen.iter_mut().find(|(g, _)| *g == grid) {
+                Some((_, count)) => {
+                    *count += 1;
+                    *count
+                }
+                None => {
+                    seen.push((grid, 1));
+                    1
+                }
+            };
+            assert_eq!(
+                ns.frame_history.len(),
+                count.min(FRAME_HISTORY_CAPACITY),
+                "{grid:?} window was cleared"
+            );
+        }
+    }
+
+    /// ESP32-C6 (#1005), 84/16 HE-SU 256 / HT 64: both shapes are processed,
+    /// each in its own window, and HE stays the primary grid.
+    #[test]
+    fn c6_he_ht_mix_processes_both_grids_without_mixing() {
+        let he = (256, PpduType::HeSu);
+        let mut ns = NodeState::new();
+        assert!(feed(&mut ns, ht(64))); // HT frame first after boot
+        let seq = synth_runs(he, ht(64), 84, 2_000);
+        let mut primary_switches = 0;
+        for &grid in &seq {
+            let before = ns.active_grid;
+            assert!(feed(&mut ns, grid), "{grid:?} frame rejected");
+            primary_switches += usize::from(ns.active_grid != before);
+        }
+        assert_eq!(ns.active_grid, Some(he));
+        assert_eq!(primary_switches, 1, "HT boot frame, then HE, then stable");
+        assert!(feed(&mut ns, ht(64)));
+        assert_eq!(ns.frame_history.len(), FRAME_HISTORY_CAPACITY);
+    }
+
+    /// PLAN 5.23: calibration must bind the grid the gate treats as primary,
+    /// not the densest eligible grid.
+    #[test]
+    fn calibration_grid_follows_the_primary_grid() {
+        let mut ns = NodeState::new();
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(15);
+        for i in 0..300_u64 {
+            // 2:1 192/306, both regular enough to qualify for calibration.
+            let grid = if i % 3 == 2 { ht(306) } else { ht(192) };
+            ns.accept_grid(grid);
+            ns.observe_raw_grid(
+                CsiGridKey {
+                    n_subcarriers: grid.0,
+                    ppdu_type: grid.1.to_byte(),
+                },
+                start + std::time::Duration::from_millis(i * 50),
+            );
+        }
+        assert_eq!(ns.active_grid, Some(ht(192)));
+        let (grid, _) = ns
+            .select_calibration_grid(start + std::time::Duration::from_secs(15))
+            .expect("both grids qualify");
+        assert_eq!(grid.n_subcarriers, 192, "calibration disagrees with the gate");
     }
 }
 
@@ -12799,20 +13064,19 @@ async fn udp_receiver_task(
                         observed_at,
                     );
 
-                    // ── ADR-110 / issue #1005: per-node subcarrier-grid gate ──
+                    // ── ADR-110 / issue #1005: per-node subcarrier-grid windows ──
                     // ESP32-C6 nodes interleave HE-SU 256-bin frames (~84%)
-                    // with HT 64-bin frames on the same socket. HT-LTF and
-                    // HE-LTF symbol grids are not bin-comparable, so a frame
-                    // on a different grid than the node's rolling window must
-                    // not enter the feature path. Policy (NodeState::accept_grid):
-                    // lock onto the densest grid seen, clear+re-warm on
-                    // upgrade, skip sparser-grid frames (arrival still
-                    // recorded for fps/liveness).
+                    // with HT 64-bin frames on the same socket, and S3 nodes
+                    // several HT grids. Grids are not bin-comparable, so each
+                    // one gets its own rolling window and motion baseline
+                    // (NodeState::accept_grid); only an empty frame is skipped
+                    // (arrival still recorded for fps/liveness).
+                    let frame_grid = frame.grid();
                     let grid_accepted = s
                         .node_states
                         .entry(frame.node_id)
                         .or_insert_with(NodeState::new)
-                        .accept_grid(frame.grid());
+                        .accept_grid(frame_grid);
                     if !grid_accepted {
                         debug!(
                             "node {}: skipping {}-subcarrier {:?} frame (active grid {:?})",
@@ -12886,14 +13150,19 @@ async fn udp_receiver_task(
                     // sketch bank *before* pushing it (so the score reflects
                     // pre-insert state). Result lands in `ns.last_novelty_score`
                     // for downstream model-wake gating.
-                    ns.update_novelty(&frame.amplitudes);
+                    // The bank keeps one series, so only the primary grid's
+                    // frames enter it (as before per-grid windows).
+                    let primary_grid = ns.active_grid == Some(frame_grid);
+                    if primary_grid {
+                        ns.update_novelty(&frame.amplitudes);
+                    }
 
                     ns.frame_history.push_back(frame.amplitudes.clone());
                     if ns.frame_history.len() > FRAME_HISTORY_CAPACITY {
                         ns.frame_history.pop_front();
                     }
 
-                    let sample_rate_hz = ns.effective_sample_rate_hz();
+                    let sample_rate_hz = ns.grid_sample_rate_hz(frame_grid);
                     let (
                         features,
                         mut classification,
@@ -12936,23 +13205,31 @@ async fn udp_receiver_task(
                         ns.rssi_history.pop_front();
                     }
 
-                    if ns.csi_fps_samples >= 5
-                        && ns.vital_detector.reconfigure_sample_rate(sample_rate_hz)
-                    {
-                        // Never smooth estimates computed against two clocks.
-                        ns.smoothed_hr = 0.0;
-                        ns.smoothed_br = 0.0;
-                        ns.smoothed_hr_conf = 0.0;
-                        ns.smoothed_br_conf = 0.0;
-                        ns.hr_buffer.clear();
-                        ns.br_buffer.clear();
-                    }
+                    // The vital-sign detector keeps one amplitude series, so
+                    // it takes the primary grid only; other grids' frames
+                    // carry the latest estimate forward.
+                    let vitals = if primary_grid {
+                        if ns.csi_fps_samples >= 5
+                            && ns.vital_detector.reconfigure_sample_rate(sample_rate_hz)
+                        {
+                            // Never smooth estimates computed against two clocks.
+                            ns.smoothed_hr = 0.0;
+                            ns.smoothed_br = 0.0;
+                            ns.smoothed_hr_conf = 0.0;
+                            ns.smoothed_br_conf = 0.0;
+                            ns.hr_buffer.clear();
+                            ns.br_buffer.clear();
+                        }
 
-                    let raw_vitals = ns
-                        .vital_detector
-                        .process_frame(&frame.amplitudes, &frame.phases);
-                    let vitals = smooth_vitals_node(ns, &raw_vitals);
-                    ns.latest_vitals = vitals.clone();
+                        let raw_vitals = ns
+                            .vital_detector
+                            .process_frame(&frame.amplitudes, &frame.phases);
+                        let vitals = smooth_vitals_node(ns, &raw_vitals);
+                        ns.latest_vitals = vitals.clone();
+                        vitals
+                    } else {
+                        ns.latest_vitals.clone()
+                    };
 
                     // DynamicMinCut person estimation from subcarrier correlation.
                     let corr_persons = estimate_persons_from_correlation(&ns.frame_history);
@@ -13048,7 +13325,7 @@ async fn udp_receiver_task(
                             amplitude: if suppress_raw {
                                 vec![]
                             } else {
-                                n.frame_history
+                                n.primary_frame_history()
                                     .back()
                                     .map(|a| {
                                         a.iter()
@@ -13061,7 +13338,7 @@ async fn udp_receiver_task(
                             subcarrier_count: if suppress_raw {
                                 0
                             } else {
-                                n.frame_history.back().map_or(0, |a| a.len())
+                                n.primary_frame_history().back().map_or(0, |a| a.len())
                             },
                             // ADR-110 iter 23 / iter 30 — single source of truth.
                             sync: n.sync_snapshot(),
