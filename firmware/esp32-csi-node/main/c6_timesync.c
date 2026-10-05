@@ -152,7 +152,8 @@ static void send_beacon(void)
  *     every TX (transmit_done/failed defer rearm_rx() to the timer task;
  *     calling receive() in the ISR itself is what used to bootloop). One
  *     run of a minimal app saw RX not resume after TX despite rx_when_idle,
- *     but four reruns (IDF 5.5.2 and 5.5.4) did not reproduce it.
+ *     but three reruns without the re-arm (IDF 5.5.2 and 5.5.4) did not
+ *     reproduce it.
  *  2. receive_done called ESP_LOGI(); taking the log lock in ISR context
  *     aborts (lock_acquire_generic). Logging moved to the timer task.
  *  3. The beacon was built in a stack buffer, but esp_ieee802154_transmit()

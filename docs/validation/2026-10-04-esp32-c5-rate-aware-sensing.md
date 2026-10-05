@@ -184,7 +184,7 @@ After both fixes, two 3-minute runs on both nodes:
 
 **What this shows:**
 - RX itself works.
-- In the first run, the driver didn't return to RX after the node's own TX despite `rx_when_idle`; a task-context `esp_ieee802154_receive()` fixed it. Four later reruns of that same case (two on IDF 5.5.2, one on 5.5.4, one with the re-arm build) received 835-851 of 851 frames without the re-arm, so that failure isn't reproducible. The re-arm is kept as a defensive measure.
+- In the first run, the driver didn't return to RX after the node's own TX despite `rx_when_idle`; a task-context `esp_ieee802154_receive()` fixed it. Three later reruns of that same case without the re-arm (two on IDF 5.5.2, one on 5.5.4) received 835-851 of 851 frames, so that failure isn't reproducible. The re-arm is kept as a defensive measure.
 - Wi-Fi starvation was a missing coex enable.
 - The minimal app never corrupted a frame. In RuView, that came from the beacon being built in a stack buffer that the async transmit read after it had been reused: the dumped "payload" contained RAM and register addresses (`0x4082F000`, `0x600C5090`).
 
