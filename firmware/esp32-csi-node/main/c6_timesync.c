@@ -146,12 +146,13 @@ static void send_beacon(void)
 /* 802.15.4 time-sync (ADR-383, 2026-10-05). The esp_ieee802154 callbacks
  * below run in ISR context. Four bugs made this path look dead on C6 (#762)
  * and C5; all fixed here, verified on two ESP32-C5 boards (IDF 5.5.2):
- *  1. RX was armed once at init. The driver should return to RX after each
- *     TX when rx_when_idle is set, but on C5 it doesn't unless Wi-Fi coex
- *     activity re-triggers it (minimal reproducer: 0-1 of ~1750 frames).
- *     So rx_when_idle is set AND RX is re-armed from task context after
+ *  1. RX was armed once at init and rx_when_idle was never set, so after
+ *     the first beacon TX the radio went idle. rx_when_idle is now set.
+ *     As a defensive extra, RX is also re-armed from task context after
  *     every TX (transmit_done/failed defer rearm_rx() to the timer task;
- *     calling receive() in the ISR itself is what used to bootloop).
+ *     calling receive() in the ISR itself is what used to bootloop). One
+ *     run of a minimal app saw RX not resume after TX despite rx_when_idle,
+ *     but four reruns (IDF 5.5.2 and 5.5.4) did not reproduce it.
  *  2. receive_done called ESP_LOGI(); taking the log lock in ISR context
  *     aborts (lock_acquire_generic). Logging moved to the timer task.
  *  3. The beacon was built in a stack buffer, but esp_ieee802154_transmit()
