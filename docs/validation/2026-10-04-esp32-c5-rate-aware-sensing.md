@@ -129,4 +129,38 @@ The low `yield` samples are one dip of about 4 s that hit both nodes at the same
 
 A separate 5-minute server-only run on the same build saw a different mix: 77 % of frames were 245-bin and about 22 % were 53-bin legacy frames, with the share moving between 57 % and 94 % per 500-frame window. The mix follows the traffic on the channel. The server's majority grid gate stayed on 245 in both runs.
 
-Not done: occupancy qualification (needs an empty-room session) and 2.4 GHz on these boards (the AP steered them to 5 GHz).
+
+### 2.4 GHz qualification
+
+MEASURED. Same nodes, app built with `CSI_WIFI_BAND_2G_ONLY` and the console on UART0. Both nodes joined channel 5. 5-minute run:
+
+| Gate (pass bar) | Node 6 | Node 7 |
+|---|---|---|
+| Raw callback yield (>= 20 pps) | 41.7 pps (`yield` mean 40.9) | 41.6 pps (`yield` mean 40.9) |
+| `yield` samples below 20 pps | 3 of 308 | 3 of 308 |
+| Edge DSP cadence (8 Hz +/- 1) | 8.0-8.2 Hz | 8.0-8.2 Hz |
+| ENOMEM / send fail (steady state) | 0 / 0 | 0 / 0 |
+| ENOMEM / send fail (startup burst) | 6 / 5 | 6 / 5 |
+| Panic / watchdog / lockup | 0 / 0 / 0 | 0 / 0 / 0 |
+| Server frames received | 8692 (29.0 fps) | 8344 (27.8 fps) |
+| 245-bin HE-SU share | 98.1 % | 97.9 % |
+| Server parse failures, allowlist drops | 0, 0 | 0, 0 |
+
+The ENOMEM events all fell in a burst about 300 ms after Got IP, and the sender's backoff recovered within 300 ms. The C6 record shows the same kind of startup backoff. The low `yield` samples are again one dip of about 3 s that hit both nodes at the same moment. HE-SU frames on 2.4 GHz also carry 245 bins.
+
+The Wi-Fi driver keeps the band mode in its own NVS. A band pinned by one image stayed in force after reflashing an image built with AUTO, until the firmware was changed to set the band, AUTO included, on every boot.
+
+### 802.15.4 time-sync
+
+MEASURED. App built with `C6_TIMESYNC_ENABLE=y` (802.15.4 channel 26), both nodes, 3 minutes each.
+
+- **Wi-Fi on 2.4 GHz (channel 5):** each node sent about 1750 beacons with 0 TX failures, and both reported `rx#0`.
+- **Wi-Fi on 5 GHz (channel 40):** each node sent about 1750 beacons with 0 TX failures. Node 7 received nothing. Node 6 received one frame that didn't match the beacon magic.
+
+So the C5's raw 802.15.4 RX path delivers no peer beacons. That's the same result as the C6 in #762, and it isn't a 2.4 GHz coexistence effect.
+
+With 802.15.4 enabled, node 6 also aborted once on its first boot after each flash (`lock_acquire_generic`, a lock taken from interrupt context), then ran normally.
+
+ESP-NOW time-sync between the same two nodes worked throughout: 1652-1678 of 1701 beacons matched. The C5 default stays `C6_TIMESYNC_ENABLE=n`.
+
+Not done: occupancy qualification (needs an empty-room session).

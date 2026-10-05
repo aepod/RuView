@@ -114,6 +114,30 @@ static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+        /* ADR-383: set the band on dual-band chips (C5). The driver rejects
+         * this before esp_wifi_start() (ESP_ERR_WIFI_NOT_STARTED), so apply
+         * it here, after start and before the first connect. Always set it,
+         * AUTO included: the driver keeps the band in its own NVS, so a band
+         * pinned by an earlier image would otherwise survive a reflash.
+         * Setting it re-raises STA_START, so do it once per boot. */
+        static bool s_band_set = false;
+        if (!s_band_set) {
+            s_band_set = true;
+#if defined(CONFIG_CSI_WIFI_BAND_2G_ONLY)
+            const wifi_band_mode_t band = WIFI_BAND_MODE_2G_ONLY;
+            const char *band_name = "2.4 GHz only";
+#elif defined(CONFIG_CSI_WIFI_BAND_5G_ONLY)
+            const wifi_band_mode_t band = WIFI_BAND_MODE_5G_ONLY;
+            const char *band_name = "5 GHz only";
+#else
+            const wifi_band_mode_t band = WIFI_BAND_MODE_AUTO;
+            const char *band_name = "auto (2.4 + 5 GHz)";
+#endif
+            esp_err_t band_ret = esp_wifi_set_band_mode(band);
+            ESP_LOGI(TAG, "Wi-Fi band mode %s: %s", band_name, esp_err_to_name(band_ret));
+        }
+#endif
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
@@ -242,6 +266,7 @@ static void wifi_init_sta(void)
                       "immediate retry)", esp_err_to_name(rc_ret));
         s_reconnect_timer = NULL;
     }
+
 
     ESP_ERROR_CHECK(esp_wifi_start());
 

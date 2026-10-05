@@ -10,7 +10,7 @@
 | **Relates to** | ADR-018 (CSI binary frame format), ADR-029 (RuvSense multistatic — "5 GHz unavailable on S3; C6 for dual-band"), ADR-347 (rate-aware sensing), ADR-346 (fail-closed occupancy), ADR-357 (raw-CSI calibration integrity), ADR-304 (evidence engine), ADR-182 (harness hardening) |
 | **Hardware** | ESP32-C5-WROOM-1 (rev v1.0), 16 MB flash, no PSRAM, native USB-Serial/JTAG, on an ESP32-C5-DevKitC-1 |
 | **Toolchain** | ESP-IDF **v5.5.2+** (`esp32c5` is a *preview* target — build with `idf.py --preview set-target esp32c5`). 5.5.2 carries the C5 PSRAM reset-hang fix; PSRAM modules need it |
-| **Updated** | 2026-10-05 — real cause of the C5 lockup/ROM wedge found and fixed (mmWave probe on the flash bus); PSRAM modules supported; 5 GHz CSI streaming confirmed; HE-SU 245-bin CSI after `force_lltf=0`; 5-min P3 qualification PASS on 2 nodes (see docs/validation/2026-10-04-esp32-c5-rate-aware-sensing.md) |
+| **Updated** | 2026-10-05 — real cause of the C5 lockup/ROM wedge found and fixed (mmWave probe on the flash bus); PSRAM modules supported; 5 GHz CSI streaming confirmed; HE-SU 245-bin CSI after `force_lltf=0`; 5-min qualification PASS on 2 nodes at 5 GHz and 2.4 GHz; band option added; 802.15.4 RX re-tested on C5 and still delivers nothing (see docs/validation/2026-10-04-esp32-c5-rate-aware-sensing.md) |
 
 ---
 
@@ -126,6 +126,8 @@ to exercise the band that is its reason for being.
 | DSP cadence (±1 Hz of configured) | **PENDING** | measure, then pin `CONFIG_EDGE_DSP_SAMPLE_HZ` |
 | 5 GHz CSI on silicon | **PASS (partial)** | 2026-10-05, IDF 5.5.2: joined the AP on ch 40 (5200 MHz, 11ax), 861 CSI frames in 30 s at the server (about 29 fps), 81 % PPDU 0x01 (HE-SU), 19 % 0x00 |
 | 5 GHz HE CSI frame | **PASS (2026-10-05)** | Root cause of the 53-bin frames: `acquire_csi_force_lltf = 1` (C5-only field, MAC v3) forced every PPDU to report the L-LTF. Set to 0 (as in espressif/esp-csi). MEASURED on 2 nodes, ch 40: 97-98 % of frames are HE-SU **245 bins** (490 B, the IDF esp32c5 table value; not 256), rest legacy 53 / HT 57. Server parses all of them and the #2157 majority grid gate locks on 245. |
+| 2.4 GHz CSI on silicon | **PASS (2026-10-05)** | New Kconfig `CSI_WIFI_BAND_MODE` (auto / 2.4 only / 5 only, default auto) pins the band with `esp_wifi_set_band_mode()` in the STA_START handler. Pinned to 2.4 GHz, both nodes joined ch 5 and ran the 5-minute qualification: 41.7 / 41.6 pps raw, DSP 8.0-8.2 Hz, about 98 % HE-SU 245-bin frames, 0 server parse failures. Each node logged a startup ENOMEM burst (6 events, recovered in about 300 ms, right after Got IP), none in steady state. Note: the driver persists the band in its own NVS, so the firmware sets it on every boot, AUTO included |
+| 802.15.4 time-sync on C5 | **FAIL, stays off (2026-10-05)** | `C6_TIMESYNC_ENABLE=y` on both nodes, 15.4 ch 26, 3 min each, with Wi-Fi on 2.4 GHz ch 5 and again on 5 GHz ch 40: each node sent about 1750 beacons (0 TX failures) and received **none** from the other (one stray non-matching frame on one node). Same symptom as the C6 (#762), so not a 2.4 GHz coexistence effect. Enabling it also aborted one node once on first boot (`lock_acquire_generic` from interrupt context). ESP-NOW time-sync between the same nodes works (1652-1678 of 1701 beacons matched). Default stays `C6_TIMESYNC_ENABLE=n` |
 
 Provisioning note: `provision.py flash_nvs` needs `--no-stub` for the C5 preview
 target (the flasher stub isn't available; without it the NVS write silently
@@ -155,8 +157,10 @@ fragile — a clean power-cycle recovers a wedged board.
 
 ## 5. Open questions
 
-1. IDF 5.5.0 vs 5.5.2 for true HE CSI on C5 — resolve empirically at P4.
-2. C5 sustainable DSP cadence — measure at P3.
+1. ~~IDF 5.5.0 vs 5.5.2 for true HE CSI on C5~~ — resolved 2026-10-05: not the IDF version; `force_lltf` (see §3.3). 5.5.2 is still required for PSRAM modules.
+2. ~~C5 sustainable DSP cadence~~ — resolved 2026-10-05: 8 Hz holds (8.0-8.2 Hz over 5 min on 2 nodes, both bands).
 3. C5-DevKitC-1 LED GPIO — confirm against schematic.
-4. Does C5 802.15.4 RX behave differently from the C6's (which never delivered a
-   frame, #762)? Re-test before ever enabling the 15.4 time-sync path on C5.
+4. ~~Does C5 802.15.4 RX behave differently from the C6's (#762)?~~ — answered
+   2026-10-05: no. RX delivered no peer beacons on C5 either, with Wi-Fi on
+   2.4 or 5 GHz (§3.3). The 15.4 time-sync path stays off; ESP-NOW is the
+   time-sync transport.
