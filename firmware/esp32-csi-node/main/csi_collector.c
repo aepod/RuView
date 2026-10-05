@@ -664,7 +664,10 @@ void csi_collector_init(void)
     csi_config.acquire_csi_dcm = 1U;
     csi_config.acquire_csi_beamformed = 1U;
 #if CONFIG_SOC_WIFI_MAC_VERSION_NUM >= 3
-    csi_config.acquire_csi_force_lltf = 1U;
+    /* force_lltf=1 makes HT/VHT/HE PPDUs report only the 53-bin L-LTF (106 B);
+     * 0 reports the HT/VHT/HE-LTF instead (HE20 SU: 245 bins, 490 B). See the
+     * esp32c5 CSI table in IDF api-guides/wifi.rst. */
+    csi_config.acquire_csi_force_lltf = 0U;
     csi_config.acquire_csi_vht = 1U;
     csi_config.acquire_csi_he_stbc_mode = ESP_CSI_ACQUIRE_STBC_SAMPLE_HELTFS;
     csi_config.val_scale_cfg = 0U;

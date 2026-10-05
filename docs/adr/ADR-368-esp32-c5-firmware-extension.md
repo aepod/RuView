@@ -10,7 +10,7 @@
 | **Relates to** | ADR-018 (CSI binary frame format), ADR-029 (RuvSense multistatic — "5 GHz unavailable on S3; C6 for dual-band"), ADR-347 (rate-aware sensing), ADR-346 (fail-closed occupancy), ADR-357 (raw-CSI calibration integrity), ADR-304 (evidence engine), ADR-182 (harness hardening) |
 | **Hardware** | ESP32-C5-WROOM-1 (rev v1.0), 16 MB flash, no PSRAM, native USB-Serial/JTAG, on an ESP32-C5-DevKitC-1 |
 | **Toolchain** | ESP-IDF **v5.5.2+** (`esp32c5` is a *preview* target — build with `idf.py --preview set-target esp32c5`). 5.5.2 carries the C5 PSRAM reset-hang fix; PSRAM modules need it |
-| **Updated** | 2026-10-05 — real cause of the C5 lockup/ROM wedge found and fixed (mmWave probe on the flash bus); PSRAM modules supported; 5 GHz CSI streaming confirmed (53-bin, see §3.3) |
+| **Updated** | 2026-10-05 — real cause of the C5 lockup/ROM wedge found and fixed (mmWave probe on the flash bus); PSRAM modules supported; 5 GHz CSI streaming confirmed; HE-SU 245-bin CSI after `force_lltf=0`; 5-min P3 qualification PASS on 2 nodes (see docs/validation/2026-10-04-esp32-c5-rate-aware-sensing.md) |
 
 ---
 
@@ -125,7 +125,7 @@ to exercise the band that is its reason for being.
 | physical CSI rate (≥ 20 pps raw) | **PENDING** | 5-min `:8032` poll once the TWT-off image runs stably (needs power-cycle) |
 | DSP cadence (±1 Hz of configured) | **PENDING** | measure, then pin `CONFIG_EDGE_DSP_SAMPLE_HZ` |
 | 5 GHz CSI on silicon | **PASS (partial)** | 2026-10-05, IDF 5.5.2: joined the AP on ch 40 (5200 MHz, 11ax), 861 CSI frames in 30 s at the server (about 29 fps), 81 % PPDU 0x01 (HE-SU), 19 % 0x00 |
-| 5 GHz HE CSI frame (256-bin) | **FAIL / open** | frames carry only **53 bins** (106 B), not 256 — even on 5.5.2. Next: check the C5 CSI acquire config (HE-LTF capture) rather than the IDF version |
+| 5 GHz HE CSI frame | **PASS (2026-10-05)** | Root cause of the 53-bin frames: `acquire_csi_force_lltf = 1` (C5-only field, MAC v3) forced every PPDU to report the L-LTF. Set to 0 (as in espressif/esp-csi). MEASURED on 2 nodes, ch 40: 97-98 % of frames are HE-SU **245 bins** (490 B, the IDF esp32c5 table value; not 256), rest legacy 53 / HT 57. Server parses all of them and the #2157 majority grid gate locks on 245. |
 
 Provisioning note: `provision.py flash_nvs` needs `--no-stub` for the C5 preview
 target (the flasher stub isn't available; without it the NVS write silently

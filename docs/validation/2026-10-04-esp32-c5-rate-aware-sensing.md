@@ -92,3 +92,22 @@ Raw callback yield ≥ 20 pps: **PASS (32.7 pps)**. DSP cadence within ±1 Hz of
 configured, zero steady-state ENOMEM/send-fail/watchdog/panic/reboot: **PASS on
 the observed windows** (full 300 s run pending). Server parse/coverage/freshness
 and 5 GHz: **PENDING**.
+
+## 2026-10-05 qualification (two nodes, 5 GHz)
+
+MEASURED. Two ESP32-C5-WROOM-1 boards (revision v1.0, 16 MB flash, 8 MB in-package PSRAM), logical nodes 6 and 7, ESP-IDF v5.5.2, branch `feat/esp32c5-firmware` with the GPIO17/18 flash-bus fix. Both joined the AP on channel 40 (5200 MHz, 11ax). The 5-minute run used the same app with the console routed to UART0 (local overlay, app SHA 256 `91954e3c89f27fce7948e511256931b3096425a8f61012d60697bdf62c9dde85`) so device counters were readable through the board's UART bridge; the committed image logs to USB-Serial-JTAG instead. The server was sensing-server built from `fix/multinode-loop-freeze-upstream` (PR #2157), UDP 5006, source allowlist on.
+
+| Gate (pass bar) | Node 6 | Node 7 |
+|---|---|---|
+| Raw callback yield (>= 20 pps) | 42.3 pps (`yield` mean 41.6) | 41.9 pps (`yield` mean 41.2) |
+| Edge DSP cadence (8 Hz +/- 1) | 8.0-8.1 Hz | 8.0-8.2 Hz |
+| ENOMEM / send fail / panic / watchdog / lockup | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 |
+| Resets in run | 1 (power-on) | 1 (power-on) |
+| Server frames received | 8238 (27.5 fps) | 8221 (27.4 fps) |
+| Server parse failures, allowlist drops | 0, 0 | 0, 0 |
+
+Server `/health` reported `processing.state = live` in 58 of 60 samples; the two `idle` samples were before the nodes restarted when the console ports opened. Result: **PASS** for raw yield, DSP cadence, device stability and server parse/freshness. The minimum `yield` sample (5 pps) is the boot interval.
+
+That run used `acquire_csi_force_lltf = 1`, so frames carried 53 bins. After setting it to 0 (same day, committed image with USB-JTAG console, app SHA 256 prefix `c0db522ed08c4ab8`), a 75 s capture gave 2133 and 2166 CSI frames (about 28.5 fps per node), with 97-98 % HE-SU frames of **245 bins** (490 B I/Q) and the rest legacy 53 / HT 57 bins. A 40 s server run parsed all of them, locked both nodes' grid gate on 245, and logged no warnings.
+
+Not done: a 5-minute re-run of the device counters on the 245-bin image, occupancy qualification (needs an empty-room session), and 2.4 GHz on these boards (the AP steered them to 5 GHz).
