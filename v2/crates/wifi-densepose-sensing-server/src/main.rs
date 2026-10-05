@@ -8678,15 +8678,15 @@ fn calibrated_vitals_for_publication(
     vitals_for_publication(candidates, true, evidence.person_count)
 }
 
-fn edge_vitals_message_for_publication(
-    raw: &Esp32VitalsPacket,
-    published_vitals: Option<&VitalSigns>,
+/// Why an edge vitals message carries no numeric rates. `None` only when the
+/// calibrated gate authorised publication.
+fn vitals_abstention_reason(
+    numeric_vitals_authorized: bool,
     bootstrap_empty: bool,
     explicit_calibration_fresh: bool,
     person_count: usize,
-) -> serde_json::Value {
-    let numeric_vitals_authorized = published_vitals.is_some();
-    let abstention_reason = if numeric_vitals_authorized {
+) -> Option<&'static str> {
+    if numeric_vitals_authorized {
         None
     } else if bootstrap_empty {
         Some("bootstrap_empty_background")
@@ -8696,7 +8696,23 @@ fn edge_vitals_message_for_publication(
         Some("exactly_one_occupant_required")
     } else {
         Some("vital_quality_gate_failed")
-    };
+    }
+}
+
+fn edge_vitals_message_for_publication(
+    raw: &Esp32VitalsPacket,
+    published_vitals: Option<&VitalSigns>,
+    bootstrap_empty: bool,
+    explicit_calibration_fresh: bool,
+    person_count: usize,
+) -> serde_json::Value {
+    let numeric_vitals_authorized = published_vitals.is_some();
+    let abstention_reason = vitals_abstention_reason(
+        numeric_vitals_authorized,
+        bootstrap_empty,
+        explicit_calibration_fresh,
+        person_count,
+    );
     // This legacy message identifies one node. Room absence may suppress it,
     // but another node's positive count must not be assigned to this node.
     let local_presence = classify_vitals(raw.motion, raw.presence, raw.presence_score).presence;
@@ -8727,6 +8743,117 @@ fn edge_vitals_message_for_publication(
         "numeric_vitals_authorized": numeric_vitals_authorized,
         "abstention_reason": abstention_reason,
     })
+}
+
+/// Numeric candidates carried by a radar-fused edge packet. They are only
+/// candidates: publication still requires `calibrated_vitals_for_publication`.
+fn edge_fused_vital_candidates(raw: &EdgeFusedVitalsPacket) -> VitalSigns {
+    let present = (raw.flags & 0x09) != 0;
+    let confidence = if present {
+        (f64::from(raw.fusion_confidence) / 100.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    VitalSigns {
+        breathing_rate_bpm: (raw.breathing_rate_bpm > 0.0)
+            .then_some(f64::from(raw.breathing_rate_bpm)),
+        heart_rate_bpm: (raw.heartrate_bpm > 0.0).then_some(f64::from(raw.heartrate_bpm)),
+        breathing_confidence: confidence,
+        heartbeat_confidence: confidence,
+        signal_quality: f64::from(raw.presence_score),
+    }
+}
+
+/// Govern a radar-fused edge packet with the same policy as `edge_vitals`:
+/// fused and mmWave rates are published only when the calibrated
+/// single-occupant gate authorised them, otherwise they are null and an
+/// abstention reason is given. Presence and counts follow the room envelope.
+fn edge_fused_vitals_message_for_publication(
+    raw: &EdgeFusedVitalsPacket,
+    published_vitals: Option<&VitalSigns>,
+    bootstrap_empty: bool,
+    explicit_calibration_fresh: bool,
+    person_count: usize,
+) -> serde_json::Value {
+    let numeric_vitals_authorized = published_vitals.is_some();
+    let abstention_reason = vitals_abstention_reason(
+        numeric_vitals_authorized,
+        bootstrap_empty,
+        explicit_calibration_fresh,
+        person_count,
+    );
+    // Same node-local rule as `edge_vitals`: room absence suppresses this
+    // node, but another node's count is never assigned to it.
+    let local_presence = (raw.flags & 0x09) != 0;
+    let effective_presence = local_presence && !bootstrap_empty && person_count > 0;
+    let effective_person_count = if effective_presence {
+        (raw.n_persons as usize).max(1)
+    } else {
+        0
+    };
+    let authorized_rate = |bpm: f32| {
+        (numeric_vitals_authorized && bpm.is_finite() && bpm > 0.0).then_some(bpm)
+    };
+
+    serde_json::json!({
+        "type": "edge_fused_vitals",
+        "node_id": raw.node_id,
+        "presence": effective_presence,
+        "breathing_rate_bpm": published_vitals
+            .and_then(|vitals| vitals.breathing_rate_bpm),
+        "heartrate_bpm": published_vitals
+            .and_then(|vitals| vitals.heart_rate_bpm),
+        "n_persons": effective_person_count,
+        "person_count_valid": raw.person_count_valid && !bootstrap_empty,
+        "fusion_confidence": raw.fusion_confidence,
+        "mmwave": {
+            "hr_bpm": authorized_rate(raw.mmwave_hr_bpm),
+            "br_bpm": authorized_rate(raw.mmwave_br_bpm),
+            "distance_cm": effective_presence.then_some(raw.mmwave_distance_cm),
+            "targets": if effective_presence { raw.mmwave_targets } else { 0 },
+            "confidence": raw.mmwave_confidence,
+            "type": raw.mmwave_type,
+        },
+        "motion_energy": if bootstrap_empty { 0.0 } else { raw.motion_energy },
+        "presence_score": if bootstrap_empty { 0.0 } else { raw.presence_score },
+        "timestamp_ms": raw.timestamp_ms,
+        "calibrated_evidence_authorized": explicit_calibration_fresh,
+        "numeric_vitals_authorized": numeric_vitals_authorized,
+        "abstention_reason": abstention_reason,
+    })
+}
+
+/// Build the governed `edge_fused_vitals` message from current server state.
+/// The fused packet does not advance the room vote, so it reads the last
+/// debounced room count that `sensing_update` published.
+fn edge_fused_vitals_message(
+    state: &AppStateInner,
+    raw: &EdgeFusedVitalsPacket,
+    observed_at_unix_ms: u64,
+    now: std::time::Instant,
+) -> serde_json::Value {
+    let bootstrap_empty = state.bootstrap_empty_prior_applies(observed_at_unix_ms);
+    let room_person_count = if bootstrap_empty
+        || !state.node_states.values().any(|n| node_is_fresh(n, now))
+    {
+        0
+    } else {
+        state.prev_person_count
+    };
+    let explicit_calibration_fresh = state.explicit_calibration_fresh_at(observed_at_unix_ms);
+    let published_vitals = calibrated_vitals_for_publication(
+        state,
+        &edge_fused_vital_candidates(raw),
+        room_person_count,
+        observed_at_unix_ms,
+    );
+    edge_fused_vitals_message_for_publication(
+        raw,
+        published_vitals.as_ref(),
+        bootstrap_empty,
+        explicit_calibration_fresh,
+        room_person_count,
+    )
 }
 
 fn opaque_calibration_id(prefix: &str) -> String {
@@ -9478,6 +9605,110 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(message["n_persons"], 1);
         assert_eq!(message["breathing_rate_bpm"], 15.0);
         assert_eq!(message["heartrate_bpm"], 72.0);
+        assert_eq!(message["numeric_vitals_authorized"], true);
+        assert!(message["abstention_reason"].is_null());
+    }
+
+    fn raw_fused_vitals() -> EdgeFusedVitalsPacket {
+        EdgeFusedVitalsPacket {
+            node_id: 9,
+            flags: 0b0000_1001,
+            breathing_rate_bpm: 16.0,
+            heartrate_bpm: 72.0,
+            rssi: -55,
+            n_persons: 1,
+            person_count_valid: true,
+            mmwave_type: 2,
+            fusion_confidence: 85,
+            motion_energy: 0.42,
+            presence_score: 0.95,
+            timestamp_ms: 1_234_567,
+            mmwave_hr_bpm: 71.5,
+            mmwave_br_bpm: 15.8,
+            mmwave_distance_cm: 182.0,
+            mmwave_targets: 1,
+            mmwave_confidence: 90,
+        }
+    }
+
+    /// Before this gate the fused broadcast copied the device's 16/72 BPM
+    /// and mmWave 71.5/15.8 BPM verbatim with no calibration at all.
+    #[test]
+    fn uncalibrated_server_publishes_no_fused_or_mmwave_rates() {
+        let mut state = AppStateInner::minimal();
+        let now = std::time::Instant::now();
+        let node = state.node_states.entry(9).or_insert_with(NodeState::new);
+        node.last_frame_time = Some(now);
+        state.prev_person_count = 1;
+        let message = edge_fused_vitals_message(&state, &raw_fused_vitals(), 1_500, now);
+        assert_eq!(message["type"], "edge_fused_vitals");
+        assert!(message["breathing_rate_bpm"].is_null());
+        assert!(message["heartrate_bpm"].is_null());
+        assert!(message["mmwave"]["hr_bpm"].is_null());
+        assert!(message["mmwave"]["br_bpm"].is_null());
+        assert_eq!(message["numeric_vitals_authorized"], false);
+        assert_eq!(message["calibrated_evidence_authorized"], false);
+        assert_eq!(message["abstention_reason"], "explicit_calibration_required");
+        // Presence still follows the room envelope.
+        assert_eq!(message["presence"], true);
+        assert_eq!(message["n_persons"], 1);
+    }
+
+    #[test]
+    fn fused_vitals_follow_the_room_envelope_without_fresh_nodes() {
+        let mut state = AppStateInner::minimal();
+        state.prev_person_count = 1;
+        let message = edge_fused_vitals_message(
+            &state,
+            &raw_fused_vitals(),
+            1_500,
+            std::time::Instant::now(),
+        );
+        assert_eq!(message["presence"], false);
+        assert_eq!(message["n_persons"], 0);
+        assert_eq!(message["mmwave"]["targets"], 0);
+        assert!(message["mmwave"]["distance_cm"].is_null());
+        assert!(message["heartrate_bpm"].is_null());
+    }
+
+    #[test]
+    fn bootstrap_empty_background_suppresses_fused_vitals() {
+        let message =
+            edge_fused_vitals_message_for_publication(&raw_fused_vitals(), None, true, false, 0);
+        assert_eq!(message["presence"], false);
+        assert_eq!(message["n_persons"], 0);
+        assert_eq!(message["person_count_valid"], false);
+        assert_eq!(message["motion_energy"], 0.0);
+        assert_eq!(message["presence_score"], 0.0);
+        assert!(message["mmwave"]["hr_bpm"].is_null());
+        assert_eq!(message["abstention_reason"], "bootstrap_empty_background");
+    }
+
+    #[test]
+    fn multi_occupant_room_abstains_from_fused_vitals() {
+        let message =
+            edge_fused_vitals_message_for_publication(&raw_fused_vitals(), None, false, true, 2);
+        assert!(message["breathing_rate_bpm"].is_null());
+        assert!(message["mmwave"]["br_bpm"].is_null());
+        assert_eq!(message["abstention_reason"], "exactly_one_occupant_required");
+        assert_eq!(message["n_persons"], 1, "count stays node-local");
+    }
+
+    #[test]
+    fn explicit_single_occupant_may_publish_fused_vitals() {
+        let candidates = edge_fused_vital_candidates(&raw_fused_vitals());
+        let published = vitals_for_publication(&candidates, true, 1).unwrap();
+        let message = edge_fused_vitals_message_for_publication(
+            &raw_fused_vitals(),
+            Some(&published),
+            false,
+            true,
+            1,
+        );
+        assert_eq!(message["breathing_rate_bpm"], 16.0);
+        assert_eq!(message["heartrate_bpm"], 72.0);
+        assert_eq!(message["mmwave"]["hr_bpm"], 71.5);
+        assert_eq!(message["mmwave"]["distance_cm"], 182.0);
         assert_eq!(message["numeric_vitals_authorized"], true);
         assert!(message["abstention_reason"].is_null());
     }
@@ -12988,27 +13219,18 @@ async fn udp_receiver_task(
                         fused.node_id, fused.breathing_rate_bpm, fused.heartrate_bpm,
                         fused.mmwave_targets, fused.fusion_confidence,
                     );
-                    let s = state.write().await;
-                    if let Ok(json) = serde_json::to_string(&serde_json::json!({
-                        "type": "edge_fused_vitals",
-                        "node_id": fused.node_id,
-                        "breathing_rate_bpm": fused.breathing_rate_bpm,
-                        "heartrate_bpm": fused.heartrate_bpm,
-                        "n_persons": fused.n_persons,
-                        "person_count_valid": fused.person_count_valid,
-                        "fusion_confidence": fused.fusion_confidence,
-                        "mmwave": {
-                            "hr_bpm": fused.mmwave_hr_bpm,
-                            "br_bpm": fused.mmwave_br_bpm,
-                            "distance_cm": fused.mmwave_distance_cm,
-                            "targets": fused.mmwave_targets,
-                            "confidence": fused.mmwave_confidence,
-                            "type": fused.mmwave_type,
-                        },
-                        "motion_energy": fused.motion_energy,
-                        "presence_score": fused.presence_score,
-                        "timestamp_ms": fused.timestamp_ms,
-                    })) {
+                    let s = state.read().await;
+                    let observed_at_unix_ms =
+                        chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    // #2147 policy: raw device rates never reach the
+                    // broadcast without the calibrated single-occupant gate.
+                    let message = edge_fused_vitals_message(
+                        &s,
+                        &fused,
+                        observed_at_unix_ms,
+                        std::time::Instant::now(),
+                    );
+                    if let Ok(json) = serde_json::to_string(&message) {
                         let _ = s.tx.send(json);
                     }
                     continue;
