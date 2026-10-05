@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Status** | Proposed — firmware **builds, flashes, and boots/runs on real C5 silicon with dual-band WiFi active** (2026-10-04, P1+P2 done); physical CSI rate/accuracy qualification (P3–P4) + validation record (P5) PENDING |
+| **Status** | Proposed — P1-P4 done on real C5 silicon (2026-10-05): builds on IDF 5.5.2+, boots on PSRAM and non-PSRAM modules, 5-minute qualification PASS on 2 nodes at 5 GHz and 2.4 GHz with 245-bin HE-SU CSI, band option, CI build job; 802.15.4 time-sync fixed but opt-in (follow-ups in #2162). Pending: empty-room occupancy qualification (P5) and C6 hardware run of the 15.4 fixes |
 | **Date** | 2026-10-04 (created) |
 | **Deciders** | Mathew Beane (WeaveLogic) |
 | **Codename** | **C5-DUALBAND** |
@@ -143,14 +143,15 @@ fragile — a clean power-cycle recovers a wedged board.
   prints the `ESP32-C5 CSI Node` banner, brings up the CSI collector and bounded
   serial onboarding, runs at 240 MHz with the WiFi stack in dual-band mode
   (`band mode:0x3`). `RUVIEW_HELLO_V1` handshake over USB-JTAG still to exercise.
-- **P3 — CSI capture on 2.4 GHz (in progress):** provisioned via `provision.py`
-  (`--no-stub` fix); joined WiFi, CSI callback confirmed firing on C5. Blocked on
-  continuous-run stability by the TWT lockup (now fixed: `C6_TWT_ENABLE=n`) — after
-  a power-cycle, run 5 min and confirm raw yield ≥ 20 pps + stable DSP, then pin
-  `CONFIG_EDGE_DSP_SAMPLE_HZ`.
-- **P4 — 5 GHz dual-band CSI:** provision a UNII-1 channel (36/40/44); confirm HE
-  frame is 256-bin (bump IDF to 5.5.2+ if it is 64-bin HT).
-- **P5 — Validation record + evidence gate:** emit
+- **P3 — CSI capture on 2.4 GHz (DONE, 2026-10-05):** the real lockup cause was
+  the mmWave probe on the flash bus (§3.3), not TWT. 5-minute run on 2 nodes,
+  band pinned to 2.4 GHz: ~41.7 pps raw, DSP 8.0-8.2 Hz, 0 steady-state errors.
+  `CONFIG_EDGE_DSP_SAMPLE_HZ` stays 8.
+- **P4 — 5 GHz dual-band CSI (DONE, 2026-10-05):** 5-minute run on 2 nodes on
+  ch 40: ~40 pps raw, about 98 % HE-SU frames at **245 bins** (not 256) after
+  `force_lltf=0`. It wasn't the IDF version; 5.5.2+ is still required for PSRAM.
+- **P5 — Validation record + evidence gate (validation record written; occupancy
+  qualification pending):** emit
   `docs/validation/<date>-esp32-c5-*.md` in the ADR-110 format (5-min dual-table
   physical result against the pass bar), run `ruview_claim_check` / `ruview_verify`,
   write the ADR-304 EvidenceRecord. Only then does this ADR move to **Accepted**.
