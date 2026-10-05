@@ -9,7 +9,8 @@
 | **Extends** | [ADR-110](ADR-110-esp32-c6-firmware-extension.md) (ESP32-C6 firmware extension — the template this mirrors) |
 | **Relates to** | ADR-018 (CSI binary frame format), ADR-029 (RuvSense multistatic — "5 GHz unavailable on S3; C6 for dual-band"), ADR-347 (rate-aware sensing), ADR-346 (fail-closed occupancy), ADR-357 (raw-CSI calibration integrity), ADR-304 (evidence engine), ADR-182 (harness hardening) |
 | **Hardware** | ESP32-C5-WROOM-1 (rev v1.0), 16 MB flash, no PSRAM, native USB-Serial/JTAG, on an ESP32-C5-DevKitC-1 |
-| **Toolchain** | ESP-IDF **v5.5** (`esp32c5` is a *preview* target — build with `idf.py --preview set-target esp32c5`) |
+| **Toolchain** | ESP-IDF **v5.5.2+** (`esp32c5` is a *preview* target — build with `idf.py --preview set-target esp32c5`). 5.5.2 carries the C5 PSRAM reset-hang fix; PSRAM modules need it |
+| **Updated** | 2026-10-05 — real cause of the C5 lockup/ROM wedge found and fixed (mmWave probe on the flash bus); PSRAM modules supported; 5 GHz CSI streaming confirmed (53-bin, see §3.3) |
 
 ---
 
@@ -103,6 +104,9 @@ to exercise the band that is its reason for being.
   are on **v5.5.0**; this must be confirmed empirically at capture time, and IDF
   bumped to 5.5.2+ if the first HE frame comes back 64-bin.
 - DSP cadence is provisional until measured on C5 silicon.
+- PSRAM: retail C5 modules (N8R8/N16R8) carry in-package PSRAM on the same MSPI
+  bus as flash. The overlay enables `CONFIG_SPIRAM` with `CONFIG_SPIRAM_IGNORE_NOTFOUND`,
+  so both PSRAM and no-PSRAM modules boot. Never route peripherals to GPIO15-22 on C5.
 - C5-DevKitC-1 LED GPIO is a best-guess (27) pending schematic confirmation —
   cosmetic only.
 
@@ -117,10 +121,11 @@ to exercise the band that is its reason for being.
 | flash + hash verify on silicon | **PASS** | `Wrote 1,152,000 B @ 0x20000 … Hash of data verified`; `--chip esp32c5` (2026-10-04) |
 | boots + runs on C5 | **PASS** | serial: `ESP32-C5 CSI Node (ADR-018 / ADR-110) — v0.8.12 — Node ID: 1`; CSI collector + bounded serial onboarding up; 240 MHz; coredump partition live; **WiFi `band mode:0x3` (dual-band 2.4+5 GHz active)** (2026-10-04) |
 | WiFi join + CSI capture on silicon | **PASS (partial)** | provisioned (NVS), joined WiFi (`Got IP` (LAN address)), auto-detected AP ch 5, promiscuous CSI up, **first CSI callback fired** (`CSI cb #1: len=106 rssi=-42 ch=5`) (2026-10-04) |
-| continuous-run stability | **FIXED (needs re-verify)** | hit `CPU_LOCKUP` ~1 s in, immediately after `AP does not support setup individual TWT agreement` → **TWT on the C5 preview WiFi driver locks up against a non-iTWT AP**. Fixed: `CONFIG_C6_TWT_ENABLE=n` in the C5 overlay. Re-verify after a board power-cycle (preview silicon wedges in a ROM-stage `TG0_WDT` loop after many rapid flash/reset cycles). |
+| continuous-run stability | **FIXED + VERIFIED (2026-10-05)** | Root cause was not TWT. `mmwave_sensor_init()` fell through to the S3 default UART1 pins **GPIO17/18**, which on the C5 are the flash/PSRAM MSPI bus (MISO=17, WP=18; bus = GPIO15-22). About 6 s after boot the probe rerouted them, the CPU locked up (`rst:0x1a`, PC in `panic_handler`, no core dump), and the flash was left mid-transaction, so every following reset looped in ROM on `SPI flash busy detected(0x0f)` + `TG0_WDT` until a power cycle. That was the "ROM-stage wedge" seen on 2026-10-04. Fix: C5 probe defaults to GPIO4/5 and refuses GPIO15-22; C5 console pins (11/12) used for the overlap check. Verified on an ESP32-C5-WROOM-1 with 8 MB PSRAM: 45 s+ with no reset, probe on TX=4/RX=5, CSI streaming. TWT stays off (`C6_TWT_ENABLE=n`). |
 | physical CSI rate (≥ 20 pps raw) | **PENDING** | 5-min `:8032` poll once the TWT-off image runs stably (needs power-cycle) |
 | DSP cadence (±1 Hz of configured) | **PENDING** | measure, then pin `CONFIG_EDGE_DSP_SAMPLE_HZ` |
-| 5 GHz HE CSI frame (256-bin, PPDU 0x01) | **PENDING** | capture on UNII-1; confirms IDF 5.5.0-vs-5.5.2 HE path |
+| 5 GHz CSI on silicon | **PASS (partial)** | 2026-10-05, IDF 5.5.2: joined the AP on ch 40 (5200 MHz, 11ax), 861 CSI frames in 30 s at the server (about 29 fps), 81 % PPDU 0x01 (HE-SU), 19 % 0x00 |
+| 5 GHz HE CSI frame (256-bin) | **FAIL / open** | frames carry only **53 bins** (106 B), not 256 — even on 5.5.2. Next: check the C5 CSI acquire config (HE-LTF capture) rather than the IDF version |
 
 Provisioning note: `provision.py flash_nvs` needs `--no-stub` for the C5 preview
 target (the flasher stub isn't available; without it the NVS write silently

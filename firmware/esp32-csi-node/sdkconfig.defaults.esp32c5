@@ -8,7 +8,7 @@
 #   idf.py set-target esp32c5
 #   idf.py build
 #
-# Hardware: ESP32-C5-WROOM-1 (16 MB flash, no PSRAM) on an ESP32-C5-DevKitC-1.
+# Hardware: ESP32-C5-WROOM-1 (16 MB flash, with or without in-package PSRAM) on an ESP32-C5-DevKitC-1.
 # Confirmed in hand: ESP32-C5 (rev v1.0), dual-band Wi-Fi 6 (2.4 + 5 GHz),
 # BT 5 LE, IEEE 802.15.4, single HP RISC-V core (240 MHz) + LP core, 48 MHz
 # crystal, 16 MB flash, no PSRAM, native USB-Serial/JTAG.
@@ -77,9 +77,16 @@ CONFIG_ULP_COPROC_ENABLED=y
 CONFIG_ULP_COPROC_TYPE_LP_CORE=y
 CONFIG_ULP_COPROC_RESERVE_MEM=8192
 
-# ── No display, no WASM, no mmWave on the C5 research target ──
-# Same constraint as C6: no PSRAM (WASM3/ADR-040 needs it), no 8 MB OTG
-# framebuffer path (display/ADR-045). mmWave is a separate board.
+# ── PSRAM: optional (ADR-368) ──
+# Retail C5-WROOM-1 variants (N8R8, N16R8, ...) carry in-package PSRAM on the
+# shared MSPI bus. Initialise it when present; boards without it boot as before.
+# Needs ESP-IDF >= 5.5.2 (the C5 PSRAM reset-hang fix).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y
+
+# ── No display, no WASM on the C5 research target ──
+# No WASM3 (ADR-040) and no 8 MB OTG framebuffer path (display/ADR-045).
+# mmWave stays probe-only, on GPIO4/5 (GPIO15-22 are the flash/PSRAM bus).
 # CONFIG_DISPLAY_ENABLE is not set
 # CONFIG_WASM_ENABLE is not set
 
