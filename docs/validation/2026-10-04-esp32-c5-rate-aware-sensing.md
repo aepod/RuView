@@ -110,4 +110,23 @@ Server `/health` reported `processing.state = live` in 58 of 60 samples; the two
 
 That run used `acquire_csi_force_lltf = 1`, so frames carried 53 bins. After setting it to 0 (same day, committed image with USB-JTAG console, app SHA 256 prefix `c0db522ed08c4ab8`), a 75 s capture gave 2133 and 2166 CSI frames (about 28.5 fps per node), with 97-98 % HE-SU frames of **245 bins** (490 B I/Q) and the rest legacy 53 / HT 57 bins. A 40 s server run parsed all of them, locked both nodes' grid gate on 245, and logged no warnings.
 
-Not done: a 5-minute re-run of the device counters on the 245-bin image, occupancy qualification (needs an empty-room session), and 2.4 GHz on these boards (the AP steered them to 5 GHz).
+### 5-minute re-run on the 245-bin build
+
+MEASURED, same two nodes and setup, app with `force_lltf = 0` and the console on UART0 (app SHA 256 `f064e8eb30e0256e08d4bb67273aac00fbc597d3e95c963037ac563155fd0db4`).
+
+| Gate (pass bar) | Node 6 | Node 7 |
+|---|---|---|
+| Raw callback yield (>= 20 pps) | 40.3 pps (`yield` mean 39.6) | 39.6 pps (`yield` mean 39.0) |
+| `yield` samples below 20 pps | 5 of 304 | 4 of 304 |
+| Edge DSP cadence (8 Hz +/- 1) | 8.0-8.2 Hz | 8.0-8.1 Hz |
+| ENOMEM / send fail / panic / watchdog / lockup | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 |
+| Resets in run | 1 (power-on) | 1 (power-on) |
+| Server frames received | 8461 (28.2 fps) | 8067 (26.9 fps) |
+| 245-bin HE-SU share | 98.0 % | 97.9 % |
+| Server parse failures, allowlist drops | 0, 0 | 0, 0 |
+
+The low `yield` samples are one dip of about 4 s that hit both nodes at the same time (about 142-146 s into the run), plus one 19 pps sample on node 6. A simultaneous dip on two boards points at the AP or the channel rather than the node; the cause was not investigated. The CSI callback length on both nodes was 490 B (245 bins).
+
+A separate 5-minute server-only run on the same build saw a different mix: 77 % of frames were 245-bin and about 22 % were 53-bin legacy frames, with the share moving between 57 % and 94 % per 500-frame window. The mix follows the traffic on the channel. The server's majority grid gate stayed on 245 in both runs.
+
+Not done: occupancy qualification (needs an empty-room session) and 2.4 GHz on these boards (the AP steered them to 5 GHz).
