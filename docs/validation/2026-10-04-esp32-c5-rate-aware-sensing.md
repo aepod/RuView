@@ -196,4 +196,22 @@ After both fixes, two 3-minute runs on both nodes:
 
 802.15.4 time-sync works now but stays opt-in (`C6_TIMESYNC_ENABLE=n` by default) because of the CSI cost. ESP-NOW remains the default.
 
-Not done: occupancy qualification (needs an empty-room session).
+### Empty-room occupancy (uncalibrated)
+
+MEASURED 2026-10-05. Both C5 nodes on 5 GHz channel 40, running the default image. The room was left empty, and a 540 s raw UDP capture was taken. The first 60 s are excluded.
+
+**Device side (edge vitals packets):**
+
+| Node | Vitals packets | `presence=false` (bar >= 30) | `presence=false` with `n_persons>0` (bar 0) | Flagged present while empty |
+|---|---|---|---|---|
+| 6 | 448 | 440 | 0 | 8 (1.8 %) |
+| 7 | 452 | 405 | 0 | 47 (10.4 %), with 2-4 persons; motion flag set on every packet |
+
+This **passes** the bar used in the C6 occupancy record. Node 7 still shows a real false-presence rate on an empty room.
+
+**Server side, uncalibrated.** The same 480 s was replayed at original pacing through sensing-server from `main` (7c8aeace) and from #2132:
+- **Result:** both reported `presence=true`, `present_moving` and `estimated_persons=1` in 478 of 480 one-second samples. There were 0 parse failures.
+- **#2132 changed nothing here.** Its threshold fix acts near the absent/present boundary, and this signal (`motion_band_power` median about 25) sits far above it. The most likely cause is that the server's heuristic motion features don't fit C5 frames (mixed 245- and 53-bin shapes, a different amplitude scale) without calibration. That isn't proven.
+- **Status: FAIL (uncalibrated).**
+
+**Calibrated occupancy is still pending.** The server requires at least 600 s of empty-room calibration (`CALIBRATION_DURATION_S`, #1756) before its hold-out and calibrated presence evidence apply. That's longer than this capture. It needs a new empty-room session of about 20-25 min: 600 s to calibrate, then a held-out window.
