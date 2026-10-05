@@ -3448,6 +3448,67 @@ mod calibration_expiry_tests {
         assert!(body["abstention_reason"].is_null());
     }
 
+    fn vital_trend_output() -> WasmOutputPacket {
+        WasmOutputPacket {
+            node_id: 5,
+            module_id: 3,
+            events: vec![
+                WasmEvent { event_type: WASM_EVENT_BREATHING_AVG, value: 15.0 },
+                WasmEvent { event_type: WASM_EVENT_HEARTRATE_AVG, value: 72.0 },
+                WasmEvent { event_type: 200, value: 1.0 },
+            ],
+        }
+    }
+
+    fn event_types(body: &serde_json::Value) -> Vec<u64> {
+        body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["event_type"].as_u64().unwrap())
+            .collect()
+    }
+
+    /// Before this gate `/api/v1/wasm-events` returned vital_trend's
+    /// breathing/heart-rate averages with no calibration at all.
+    #[test]
+    fn wasm_events_endpoint_withholds_uncalibrated_vital_averages() {
+        let mut state = AppStateInner::minimal();
+        state.latest_wasm_events = Some(vital_trend_output());
+        let body = wasm_events_response(&state, 1_500);
+        assert_eq!(event_types(&body["wasm_events"]), vec![200], "{body}");
+        assert_eq!(body["wasm_events"]["vital_events_suppressed"], 2);
+    }
+
+    #[test]
+    fn wasm_event_broadcast_withholds_vital_averages_without_a_holdout_window() {
+        let mut state = state_with_receipt();
+        one_occupant_window(&mut state);
+        state.latest_vitals = qualified_vital_candidates();
+        let body = governed_wasm_output(&state, &vital_trend_output(), 1_500);
+        assert_eq!(event_types(&body), vec![200], "{body}");
+    }
+
+    #[test]
+    fn wasm_events_pass_through_when_vitals_are_authorised_or_not_vital() {
+        let mut state = state_with_runtime_window();
+        one_occupant_window(&mut state);
+        state.latest_vitals = qualified_vital_candidates();
+        let body = governed_wasm_output(&state, &vital_trend_output(), 1_500);
+        assert_eq!(event_types(&body), vec![110, 111, 200]);
+        assert_eq!(body["events"][1]["value"], 72.0);
+        assert_eq!(body["vital_events_suppressed"], 0);
+
+        let plain = WasmOutputPacket {
+            node_id: 5,
+            module_id: 4,
+            events: vec![WasmEvent { event_type: 200, value: 1.0 }],
+        };
+        let body = governed_wasm_output(&AppStateInner::minimal(), &plain, 1_500);
+        assert_eq!(event_types(&body), vec![200]);
+        assert_eq!(body["events"][0]["value"], 1.0);
+    }
+
     #[test]
     fn bootstrap_field_model_remains_negative_only_for_person_count() {
         let runtime = state_with_model(false);
@@ -11020,17 +11081,64 @@ fn edge_vitals_response(s: &AppStateInner, observed_at_unix_ms: u64) -> serde_js
 /// GET /api/v1/wasm-events — latest WASM events from ESP32 (ADR-040).
 async fn wasm_events_endpoint(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
+    let observed_at_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    Json(wasm_events_response(&s, observed_at_unix_ms))
+}
+
+fn wasm_events_response(s: &AppStateInner, observed_at_unix_ms: u64) -> serde_json::Value {
     match &s.latest_wasm_events {
-        Some(w) => Json(serde_json::json!({
+        Some(w) => serde_json::json!({
             "status": "ok",
-            "wasm_events": w,
-        })),
-        None => Json(serde_json::json!({
+            "wasm_events": governed_wasm_output(s, w, observed_at_unix_ms),
+        }),
+        None => serde_json::json!({
             "status": "no_data",
             "wasm_events": null,
             "message": "No WASM output packet received yet. Upload and start a .wasm module on the ESP32.",
-        })),
+        }),
     }
+}
+
+/// `vital_trend` (wasm-edge) rolling breathing and heart-rate averages.
+const WASM_EVENT_BREATHING_AVG: u8 = 110;
+const WASM_EVENT_HEARTRATE_AVG: u8 = 111;
+
+/// True when the calibrated gate would publish numeric vitals right now from
+/// either the CSI pipeline's or the edge tier's latest candidates.
+fn vitals_authorized_now(s: &AppStateInner, observed_at_unix_ms: u64) -> bool {
+    let person_count = s.person_count_at(observed_at_unix_ms);
+    std::iter::once(s.latest_vitals.clone())
+        .chain(s.edge_vitals.as_ref().map(edge_vital_candidates))
+        .any(|candidates| {
+            calibrated_vitals_for_publication(s, &candidates, person_count, observed_at_unix_ms)
+                .is_some()
+        })
+}
+
+/// A WASM output packet with numeric vital-sign events withheld unless the
+/// calibrated gate authorises vitals at this moment. Other events pass
+/// through unchanged.
+fn governed_wasm_output(
+    s: &AppStateInner,
+    output: &WasmOutputPacket,
+    observed_at_unix_ms: u64,
+) -> serde_json::Value {
+    let is_vital = |event: &&WasmEvent| {
+        matches!(event.event_type, WASM_EVENT_BREATHING_AVG | WASM_EVENT_HEARTRATE_AVG)
+    };
+    let authorized =
+        !output.events.iter().any(|e| is_vital(&e)) || vitals_authorized_now(s, observed_at_unix_ms);
+    let events: Vec<&WasmEvent> = output
+        .events
+        .iter()
+        .filter(|event| authorized || !is_vital(event))
+        .collect();
+    serde_json::json!({
+        "node_id": output.node_id,
+        "module_id": output.module_id,
+        "vital_events_suppressed": output.events.len() - events.len(),
+        "events": events,
+    })
 }
 
 async fn model_info(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -13342,13 +13450,13 @@ async fn udp_receiver_task(
                         wasm_output.events.len()
                     );
                     let mut s = state.write().await;
-                    // Broadcast WASM events via WebSocket.
-                    if let Ok(json) = serde_json::to_string(&serde_json::json!({
-                        "type": "wasm_event",
-                        "node_id": wasm_output.node_id,
-                        "module_id": wasm_output.module_id,
-                        "events": wasm_output.events,
-                    })) {
+                    // Broadcast WASM events via WebSocket, with vital-sign
+                    // events held to the calibrated gate.
+                    let observed_at_unix_ms =
+                        chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let mut message = governed_wasm_output(&s, &wasm_output, observed_at_unix_ms);
+                    message["type"] = serde_json::json!("wasm_event");
+                    if let Ok(json) = serde_json::to_string(&message) {
                         let _ = s.tx.send(json);
                     }
                     s.latest_wasm_events = Some(wasm_output);
