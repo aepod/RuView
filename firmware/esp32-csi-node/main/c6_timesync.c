@@ -142,9 +142,13 @@ static void send_beacon(void)
  *  - With 15.4 parked in RX, Wi-Fi authentication times out repeatedly
  *    (auth -> init, reason 2) and the STA only joined after ~3 min, even with
  *    the 15.4 coex priorities set to their lowest (below).
- *  - Received frames have the right PHY length and frame control but the
- *    body is the first 4 bytes repeated (e.g. 1b 41 88 00 1b 41 88 00 ...),
- *    so beacons fail the magic check. Looks like a driver/RX-buffer issue.
+ *  - In this firmware, received frames had the right PHY length and frame
+ *    control but a body of the first 4 bytes repeated, so beacons failed the
+ *    magic check. A minimal app does NOT corrupt frames (with or without
+ *    PSRAM), so this is something in RuView's setup; cause still open.
+ *  - In that minimal app, with Wi-Fi off, RX stops after the first frame even
+ *    with rx_when_idle; with a Wi-Fi STA up, RX works (~99 %) but the STA
+ *    never connects (reason 2, then 201 NO_AP_FOUND).
  * ESP-NOW (c6_sync_espnow.c) is the working time-sync transport. */
 void esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *frame_info)
 {

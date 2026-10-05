@@ -172,6 +172,18 @@ After both fixes, two 3-minute runs on both nodes:
 - **Wi-Fi blocked:** authentication timed out repeatedly (`auth -> init`, reason 2), and the STA only joined after about 179 s. Setting the 15.4 coex priorities to their lowest (idle = `IEEE802154_IDLE`, TX/RX = `LOW`) didn't change this.
 - **Corrupted frames:** a dumped frame had the beacon's PHY length (27) and frame control (`41 88`), but its body was the first 4 bytes repeated: `1b 41 88 00 1b 41 88 00 ...`. Only 1 frame per node passed the magic check.
 
+**Minimal reproducer.** A two-board IDF-only app using the same radio calls, no RuView code. 3-minute runs:
+
+| Wi-Fi | RX on node A / B (peer sent ~1750) | Frames intact | Wi-Fi |
+|---|---|---|---|
+| off | 0 / 1 | yes | n/a |
+| STA on | 1729 / 1725 | all | never connected (reason 2, then 201) |
+
+The same app with PSRAM enabled received 643 / 641 of 650 frames, all intact. So:
+- with Wi-Fi off, RX stops after the first frame even with `rx_when_idle`;
+- with Wi-Fi on, 802.15.4 RX starves the STA scan;
+- the frame corruption seen in this firmware is RuView-specific and its cause is still open.
+
 The 15.4 time-sync path stays off on the C5.
 
 Not done: occupancy qualification (needs an empty-room session).
