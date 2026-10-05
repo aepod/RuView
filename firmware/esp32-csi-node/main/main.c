@@ -361,7 +361,7 @@ void app_main(void)
 #if defined(CONFIG_IDF_TARGET_ESP32C6)
     const int led_gpio = 8;
 #elif defined(CONFIG_IDF_TARGET_ESP32C5)
-    /* TODO ADR-368: verify C5-DevKitC-1 onboard WS2812 GPIO (schematic indicates 27).
+    /* TODO ADR-383: verify C5-DevKitC-1 onboard WS2812 GPIO (schematic indicates 27).
      * Wrong value only means the status LED stays dark — not fatal to CSI. */
     const int led_gpio = 27;
 #else

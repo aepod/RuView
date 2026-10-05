@@ -333,7 +333,7 @@ menu "WASM Programmable Sensing (ADR-040)"
 
 endmenu
 
-menu "ESP32-C6/C5 (HE-class) capabilities (ADR-110, ADR-368)"
+menu "ESP32-C6/C5 (HE-class) capabilities (ADR-110, ADR-383)"
     depends on IDF_TARGET_ESP32C6 || IDF_TARGET_ESP32C5
 
     config C6_TWT_ENABLE
