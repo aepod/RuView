@@ -6,6 +6,12 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://ruos.cognitum.one">
+    <img src="assets/ruos-animated.svg" alt="RuView — WiFi becomes spatial awareness, with Ruflo coordination and a ruOS sensing workspace" width="100%">
+  </a>
+</p>
+
 
 ## **See through walls with WiFi** ##
 
@@ -141,8 +147,11 @@ RuView turns ordinary WiFi into a contactless sensor. A $9 ESP32 board reads the
 ```bash
 # Option 1: Docker (simulated data, no hardware needed)
 docker pull ruvnet/wifi-densepose:latest
-docker run -p 3000:3000 ruvnet/wifi-densepose:latest
+export RUVIEW_API_TOKEN=$(openssl rand -hex 32)   # required; the container exits 64 without it
+docker run -p 127.0.0.1:3000:3000 -e RUVIEW_API_TOKEN ruvnet/wifi-densepose:latest
 # Open http://localhost:3000
+# ESP32 nodes in Docker also need a UDP source guard (RUVIEW_UDP_ALLOW);
+# see docs/user-guide.md "Receiving ESP32 frames in Docker".
 
 # Option 2a: Live sensing with ESP32-S3 hardware ($9)
 # Flash firmware, provision WiFi, and start sensing:
