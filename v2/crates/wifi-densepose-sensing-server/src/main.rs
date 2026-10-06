@@ -35,6 +35,7 @@ mod rvf_container;
 // (including `/ws/train/progress`) into the live router below.
 mod training_api;
 mod rvf_pipeline;
+mod sync_clock;
 mod tracker_bridge;
 pub mod types;
 mod vital_signs;
@@ -1142,6 +1143,8 @@ struct NodeState {
     latest_sync: Option<wifi_densepose_hardware::SyncPacket>,
     /// Last time a sync packet from this node was received (for staleness).
     latest_sync_at: Option<std::time::Instant>,
+    /// Sync-derived clock quality for the ADR-138 gate (#2156).
+    sync_clock: sync_clock::SyncClockTracker,
     /// Arrival time of the newest grid-admitted raw CSI frame. Edge-vitals
     /// packets intentionally do not refresh this clock.
     latest_accepted_csi_at: Option<std::time::Instant>,
@@ -1465,8 +1468,18 @@ impl NodeState {
         pkt: wifi_densepose_hardware::SyncPacket,
         now: std::time::Instant,
     ) {
+        self.sync_clock.observe(&pkt, now);
         self.latest_sync = Some(pkt);
         self.latest_sync_at = Some(now);
+    }
+
+    /// ADR-138 clock quality for this node at `now`, from its ADR-110 sync
+    /// packets (#2156). No valid sync means `valid = false`.
+    pub(crate) fn clock_quality(
+        &self,
+        now: std::time::Instant,
+    ) -> wifi_densepose_engine::ClockQualityScore {
+        self.sync_clock.score(now)
     }
 
     /// ADR-110 iter 30 — pure snapshot of this node's mesh-sync state.
@@ -1558,6 +1571,7 @@ impl NodeState {
             edge_vitals: None,
             latest_sync: None,
             latest_sync_at: None,
+            sync_clock: sync_clock::SyncClockTracker::default(),
             latest_accepted_csi_at: None,
             latest_csi_sequence: None,
             latest_csi_sync_valid: false,
@@ -16282,6 +16296,25 @@ mod sync_snapshot_helper_tests {
         assert_eq!(ns.latest_sync_at, Some(now));
         // sync_snapshot now produces a value (REST 200 OK path).
         assert!(ns.sync_snapshot().is_some());
+    }
+
+    /// Issue #2156: the clock score fed to the ADR-138 gate comes from the
+    /// node's sync packets, not a hard-coded value.
+    #[test]
+    fn clock_quality_follows_sync_packets() {
+        let mut ns = NodeState::new();
+        let now = std::time::Instant::now();
+        assert!(!ns.clock_quality(now).valid, "no sync packet yet");
+
+        ns.apply_sync_packet(populated_sync(9), now);
+        let synced = ns.clock_quality(now);
+        assert!(synced.valid);
+        assert!(synced.quality(200.0) > 0.85);
+
+        let mut lost = populated_sync(9);
+        lost.flags.is_valid = false;
+        ns.apply_sync_packet(lost, now);
+        assert!(!ns.clock_quality(now).valid, "invalid sync flag drops the evidence");
     }
 
     #[test]
