@@ -9,8 +9,9 @@
   sensor identity), ADR-301/302 (calibration, domain state), ADR-063 (mmWave
   fusion), ADR-382 (`spatial.evidence.v1` RF export, amended by this ADR).
   Planned: ADR-385 (ESP32 UDP frame contract), ADR-386 (producer packaging as
-  signed RVF). Wire format origin: WeftOS ADR-107 §7 and its 2026-10-03
-  amendment; SenML, IETF RFC 8428.
+  signed RVF). Wire format: WeftOS ADR-111 (https://github.com/weave-logic-ai/weftos/blob/target-0.8.4/docs/adr/adr-111-sensor-evidence-and-readings-contracts.md), which publishes
+  `spatial.evidence.v1` (first drafted in the WeftOS spatial workspace ADR-107 §7)
+  and the SenML readings profile and vocabulary; SenML, IETF RFC 8428.
 - **Plan**: `docs/design/sensor-contracts-plan.md`. Inputs:
   `docs/design/sound-and-radio-ranging.md` and
   `docs/design/snapshot-node-sounding.md` (WeftOS session notes,
@@ -99,7 +100,7 @@ readings become `Reading` (§5). Fusion cannot mistake one for the other.
 - **Accepted types:** `radar_track_point` (with the optional `sensor` beam
   block), `radar_range`, `pose`, `shell_measure`, `human_confirm`, `tof_depth`,
   `uwb_echo` and `imu_event`, alongside the existing `rf_gaussian` and
-  `rf_link_observation`. Body rules follow WeftOS ADR-107 §7 and §7.1. They are
+  `rf_link_observation`. Body rules follow WeftOS ADR-111 §1-§2. They are
   listed in the plan, Appendix A.
 - **Envelope:** `schema`, `type`, `t_ns`, `frame` (`room_enu` only), `region`,
   `source_id`, `uncertainty_m` (0, 100], and `provenance{receipt, producer,
@@ -117,10 +118,11 @@ readings become `Reading` (§5). Fusion cannot mistake one for the other.
   calibrated vitals publication gate (#2147). The wire format grants no
   authority to publish. Until a track binding exists, external vitals are
   stored and counted, but not published or fused.
-- **Record types not yet in v1** are rejected and counted as unknown: an
-  acoustic range, a cooperative radio delay between scheduled nodes, and a
-  clock-correction row. RuView adds them in the same change in which WeftOS
-  ADR-107 defines them.
+- **Record types added to v1 by WeftOS ADR-111:** an acoustic range
+  (`acoustic_range`), a cooperative radio delay between scheduled nodes
+  (`radio_delay`), and a clock-correction row (`clock_correction`). Until RuView
+  implements them they are rejected and counted as unknown; it adds them in a
+  follow-up change, against the ADR-111 vectors.
 
 ### 4. Object readings: SenML profile
 
@@ -128,14 +130,17 @@ readings become `Reading` (§5). Fusion cannot mistake one for the other.
   (`n`), a unit (`u`) from the IANA SenML Units registry, a value (`v`, `vb`,
   `vs` or `vd`) and a time (`t`). Base fields (`bn`, `bt`, `bu`) may be used.
 - **RuView profile:**
-  - `bn` is required and is the source id. It follows the evidence id rule.
+  - `bn` is required: the source id followed by `/` (RFC 8428 resolves a name
+    as `bn` + `n`, so a record resolves to `source/quantity`, the binding-table
+    key). The source id follows the evidence id rule.
   - `proof_` is required: `MEASURED`, `CODE` or `SYNTHETIC`. The trailing
     underscore makes it must-understand under SenML's extension rules, so a
     reader that ignores it must reject the record.
   - `entity` is optional and names the ADR-306 `Space` or `Object` the reading
     describes.
   - `sigma` is optional: 1σ uncertainty in the reading's own unit.
-- **Quantity vocabulary:** a versioned file maps each name (`temperature`,
+- **Quantity vocabulary:** a versioned file (WeftOS
+  `contracts/sensors/quantities.v1.json`, ADR-111) maps each name (`temperature`,
   `humidity`, `co2`, `tvoc`, `pm2_5`, `illuminance`, `sound_level`,
   `contact`, `power`, …) to exactly one SenML unit, so `temperature` is always
   `Cel`. Records with unknown names are stored and counted, and nothing
@@ -252,7 +257,7 @@ with it, matched on recorded data, and a later ADR has decided the retirement.
 
 RuView ships valid and invalid test vectors for every evidence type and
 profile rule. The evidence vectors are generated from, and checked against,
-the WeftOS ADR-107 examples and the reference validator, so the two cannot
+the WeftOS ADR-111 golden vectors (`contracts/sensors/vectors/`) and the reference validator, so the two cannot
 drift silently. It also ships a check tool (`evidence_check FILE`). A producer
 conforms when its output passes the check. RuView needs no access to the
 device itself.

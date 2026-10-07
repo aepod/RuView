@@ -12,7 +12,7 @@ RuView currently owns the full chain from radio silicon to inference: ESP32 firm
 Meanwhile:
 
 - **Cogs already read sensors.** The cog ecosystem (the module explorer) already ships readers (cogs) for LD6002, LD2450, LD1040C, RD-03E, SEN0628 ToF and others. Each is a small signed program that writes JSON lines.
-- **A shared format already exists.** `spatial.evidence.v1` (WeftOS ADR-107 §7) is shared by RuView's RF export (ADR-382, `ruview-spatial-evidence`) and by the radar cogs (`--spatial-out`). It already defines `radar_track_point`, `radar_range`, `pose`, `shell_measure`, `human_confirm`, `tof_depth`, `uwb_echo` and `imu_event`.
+- **A shared format already exists.** `spatial.evidence.v1` (WeftOS ADR-111, first drafted in the spatial workspace ADR-107 §7) is shared by RuView's RF export (ADR-382, `ruview-spatial-evidence`) and by the radar cogs (`--spatial-out`). It already defines `radar_track_point`, `radar_range`, `pose`, `shell_measure`, `human_confirm`, `tof_depth`, `uwb_echo` and `imu_event`.
 - **RuView already rejected bespoke ingest paths.** ADR-320 (Sensor HAL) decided against "one bespoke ingest path per modality". `SensorHal` exists in `ruview-hal`, but it lives in-process only, and nothing in production uses it.
 
 The missing piece is an **inbound** contract. Something outside RuView needs a way to say "here is evidence from my sensor" without new Rust in this repository.
@@ -108,7 +108,7 @@ All references are on `main` @ `0b15c0eb`.
 - **What it accepts:** `RecordBody` has two variants, `rf_gaussian` and `rf_link_observation`. Any other type fails as `EvidenceError::Parse`; there is no dedicated `UnknownType`. The test `non_rf_types_are_unknown_to_this_emitter` (`tests/evidence.rs:383`) pins that behaviour.
 - **Proof tags:** `ProofTag` is `Synthetic | Code | Measured`, and v1 has no CLAIMED.
 - **Dependencies:** `ruview-unified` (about 5.8k LOC, plus ndarray and rand). The dependency is only needed for the RF export.
-- **Reference validator:** it lives in `weftos-spatial-core/src/evidence/validate.rs`, and its golden lines are the ADR-107 examples. RuView's `tests/evidence.rs:128,155` already copies those lines.
+- **Reference validator:** it lives in `weftos-spatial-core/src/evidence/validate.rs`, and its golden lines are the WeftOS ADR-111 vectors (`contracts/sensors/vectors/`). RuView's `tests/evidence.rs:128,155` already copies those lines.
 
 ### Sensing server (`v2/crates/wifi-densepose-sensing-server`)
 - **Router:** an axum chain at `main.rs:15047-15234`. Auth layers are applied in this order: `AuthState` (15200), privacy filter (15208), `require_bearer` (15222), host allowlist (15231). A route added after 15222 bypasses auth (comment at 15212-15221).
@@ -156,13 +156,13 @@ All references are on `main` @ `0b15c0eb`.
 1. **Feature-gate the RF export in `ruview-spatial-evidence`.**
    - The `rf-export` feature is on by default and carries the `ruview-unified` dependency plus `gaussian.rs` and `link.rs`.
    - The new `ingest` code depends only on serde, serde_json and thiserror. The server can then use `default-features = false` without pulling in ndarray.
-2. **Add the inbound bodies to `RecordBody`:** `radar_track_point` (with the optional `sensor` block), `radar_range`, `pose`, `shell_measure`, `human_confirm`, `tof_depth`, `uwb_echo` and `imu_event`. Each body is validated by the rules in ADR-107 §7 and §7.1 (table in Appendix A).
+2. **Add the inbound bodies to `RecordBody`:** `radar_track_point` (with the optional `sensor` block), `radar_range`, `pose`, `shell_measure`, `human_confirm`, `tof_depth`, `uwb_echo` and `imu_event`. Each body is validated by the rules in WeftOS ADR-111 §1-§2 (table in Appendix A).
 3. **Add `EvidenceError::UnknownType(String)`** so the server can count unknown types separately from malformed lines.
 4. **Make the emitter safe after the change:** `to_line` keeps refusing anything other than the two RF types unless the `ingest` feature is on. ADR-382's emitter rule ("does not mirror the other v1 types") is amended in the same change.
 5. **Add test vectors** in `v2/crates/ruview-spatial-evidence/tests/vectors/`:
-   - `valid/*.jsonl`: each ADR-107 example, plus edge values.
+   - `valid/*.jsonl`: each ADR-111 golden vector, plus edge values.
    - `invalid/*.jsonl`: one file per rejection rule, with the expected error in a sidecar `.expect`.
-   - The vectors are generated from, and diffed against, the ADR-107 text, so the two validators cannot drift silently.
+   - The vectors are generated from, and diffed against, the ADR-111 text and vectors, so the two validators cannot drift silently.
 6. **Add a check tool:** `cargo run -p ruview-spatial-evidence --example evidence_check -- FILE` prints accepted and rejected counts per type and reason, and exits non-zero on any rejection. It becomes a CLI subcommand later if wanted.
 7. **Update the tests:** flip `non_rf_types_are_unknown_to_this_emitter` to cover both sides: the emitter still refuses, and the reader accepts.
 
@@ -377,19 +377,19 @@ A and E can be reviewed in parallel. Each PR carries its own test evidence and c
 5. **CLAIMED.** v1's proof tags are SYNTHETIC, CODE and MEASURED, with no CLAIMED. RuView's evidence policy uses CLAIMED. Should this be mapped (to CODE on export, never to MEASURED), or proposed upstream as an addition to v1?
 6. **Portable producer builds.** The cog repo CI builds armv7/aarch64 only. x86 builds already work for at least one cog, but `ld2450-radar` ships ARM-only. A macOS or x86 build of it is needed for the Mac bench in step 3a. Is that tracked on the cog side? The 256000-baud path also needs a macOS check.
 7. **Upstream framing.** Should ADR-384 be proposed with ADR-385, or should 384 go first so the direction is seen working before the frame record?
-8. **Readings contract.** *Partly settled (2026-10-05):* WeftOS agrees with the SenML (RFC 8428) profile as described in §2a, so cogs and RuView converge on it. The ADR-384 draft now covers both inbound contracts; a reviewer may still ask for the readings part to be split into ADR-387. The question that remains is where the shared quantity vocabulary file lives. The recommendation is one file in a neutral location that both RuView and the cog catalog consume.
+8. **Readings contract.** *Partly settled (2026-10-05):* WeftOS agrees with the SenML (RFC 8428) profile as described in §2a, so cogs and RuView converge on it. The ADR-384 draft now covers both inbound contracts; a reviewer may still ask for the readings part to be split into ADR-387. *Answered 2026-10-07:* the shared quantity vocabulary is published in WeftOS as `contracts/sensors/quantities.v1.json` (ADR-111), which both RuView and the cog catalog consume.
 9. **For WeftOS: new evidence record types.** The sound-and-radio and snapshot-sounding notes (`docs/design/`, 2026-10-06) need three record types that `spatial.evidence.v1` does not have:
    - an **acoustic range**, which is not `tof_depth` (optical) and not `uwb_echo`;
    - a **cooperative radio delay** between two scheduled nodes, with its direction and whether it is one-way or round-trip;
    - a **clock correction** row (node, anchor, offset, rate, residual).
    
-   WeftOS owns the schema (ADR-107). Until these types exist, RuView rejects and counts them as unknown, and it adds them in the same change that WeftOS amends ADR-107. Request: define these three types in ADR-107.
+   WeftOS owns the schema. *Answered 2026-10-07:* WeftOS ADR-111 defines all three (`acoustic_range`, `radio_delay`, `clock_correction`); RuView adds them in a follow-up change.
 10. **Later consumer: a shell-aware empty-room baseline.** Once `shell_measure` and `pose` are known, the empty room's direct and first-bounce paths can be predicted from the outline. The existing Fresnel baseline (`wifi-densepose-signal/src/fresnel.rs`, `fresnel_confidence`) then becomes a prediction, and the residual on named paths is the person. This would be the first consumer that uses evidence geometry for people inference rather than validation. It needs its own ADR, and delay resolution stays bandwidth-limited (about 15 m at 20 MHz Wi-Fi). Is this the right next consumer after step 3a, and should WeftOS's spatial engine or RuView compute the predicted paths?
 ## 10. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Two validators (RuView, weftos-spatial-core) drift | Shared golden vectors built from the ADR-107 text; cross-check in step 1 |
+| Two validators (RuView, weftos-spatial-core) drift | Shared golden vectors built from the ADR-111 text and vectors; cross-check in step 1 |
 | New write endpoint abused | Token, allowlist, body limit, per-source rate limit, bounds, typed rejections, counters |
 | Person positions are personal data | Privacy mode suppresses positions; bounded retention; no export by default |
 | Producer clock skew corrupts alignment | Bounds on `t_ns`, skew reported per source, dual timestamps (question 4) |
@@ -397,7 +397,7 @@ A and E can be reviewed in parallel. Each PR carries its own test evidence and c
 | Reviewer load upstream | Six small PRs (five code PRs plus a docs-only validation record), each standalone, each with its own evidence |
 | Cog not buildable on the bench host | Pull also works from a Pi; the file transport works from any host |
 
-## Appendix A: inbound body rules (from ADR-107 §7, §7.1, `weftos-spatial-core/src/evidence/validate.rs:126-210`)
+## Appendix A: inbound body rules (from WeftOS ADR-111, origin spatial ADR-107 §7, §7.1, `weftos-spatial-core/src/evidence/validate.rs:126-210`)
 
 | Type | Required | Optional | Rules |
 |---|---|---|---|
